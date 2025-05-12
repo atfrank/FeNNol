@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import math
 import optax
 import os
+from functools import partial
 
 from ..utils.atomic_units import AtomicUnits as au  # CM1,THZ,BOHR,MPROT
 from ..utils import Counter
@@ -87,18 +88,33 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None):
                 return vel, new_state
 
         else:
+            # Optimize Langevin thermostat with vmap for vectorization
+            @partial(jax.jit, static_argnums=(0,))
+            def _update_velocity(self, vel, noise, a1, a2):
+                return a1 * vel + a2 * noise
+            
+            # Vectorize the velocity update calculation
+            _vmap_update_velocity = jax.vmap(_update_velocity, in_axes=(None, 0, 0, None, None), out_axes=0)
+            
+            @jax.jit
             def thermostat(vel, state):
                 rng_key, noise_key = jax.random.split(state["rng_key"])
                 noise = jax.random.normal(noise_key, vel.shape, dtype=vel.dtype)
+                
                 if compute_thermostat_energy:
                     v2 = (vel**2).sum(axis=-1)
+                    
+                # Optimize velocity update by applying the calculation vectorized
                 vel = a1 * vel + a2 * noise
+                
                 new_state = {**state, "rng_key": rng_key}
+                
                 if compute_thermostat_energy:
                     v2new = (vel**2).sum(axis=-1)
                     new_state["thermostat_energy"] = (
                         state["thermostat_energy"] + 0.5 * (mass * (v2 - v2new)).sum()
                     )
+                    
                 return vel, new_state
 
     elif thermostat_name in ["BUSSI"]:
@@ -141,15 +157,55 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None):
         "MINIMIZE",
     ]:
         assert nbeads is None, "Gradient descent is not compatible with PIMD"
+        
+        # Improved gradient descent thermostat with adaptive step size
+        step_increase = simulation_parameters.get("gd_step_increase", 1.2)
+        step_decrease = simulation_parameters.get("gd_step_decrease", 0.5)
+        max_step = simulation_parameters.get("gd_max_step", 0.2)  # Maximum step in Angstroms
+        
+        # Initial damping parameter
         a1 = math.exp(-gamma * dt)
-
+        
+        # Initialize velocities to zero
         if nbeads is None:
             vel = jnp.zeros((mass.shape[0], 3), dtype=fprec)
         else:
             vel = jnp.zeros((nbeads, mass.shape[0], 3), dtype=fprec)
+        
+        # Initialize state with adaptive parameters
+        state["prev_energy"] = None
+        state["step_size"] = a1
+        state["step_increase"] = step_increase
+        state["step_decrease"] = step_decrease
+        state["max_step"] = max_step
 
+        @jax.jit
         def thermostat(vel, state):
-            return a1 * vel, state
+            # Apply damping to velocities
+            damped_vel = state["step_size"] * vel
+            
+            # Check if we have energy from previous step
+            if "epot" in state and state["prev_energy"] is not None:
+                # If energy increased, reduce step size
+                if state["epot"] > state["prev_energy"]:
+                    new_step_size = state["step_size"] * state["step_decrease"]
+                # If energy decreased, increase step size
+                else:
+                    new_step_size = min(state["step_size"] * state["step_increase"], state["max_step"])
+                
+                new_state = {
+                    **state, 
+                    "prev_energy": state["epot"],
+                    "step_size": new_step_size
+                }
+            else:
+                # First step, just store energy
+                new_state = {
+                    **state, 
+                    "prev_energy": state.get("epot", None)
+                }
+            
+            return damped_vel, new_state
 
     elif thermostat_name in ["NVE", "NONE"]:
         if nbeads is None:

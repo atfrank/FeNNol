@@ -24,6 +24,7 @@ from ..utils.input_parser import parse_input
 from .thermostats import get_thermostat
 from .barostats import get_barostat
 from .colvars import setup_colvars
+from .restraints import setup_restraints, apply_restraints
 from .spectra import initialize_ir_spectrum
 
 from copy import deepcopy
@@ -44,6 +45,7 @@ def initialize_dynamics(
         system_data,
         fprec,
     )
+    
     return step, update_conformation, dyn_state, {**system, **thermo_state}
 
 
@@ -64,6 +66,9 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
         "dt": dt,
         "pimd": nbeads is not None,
     }
+    
+    # Initialize restraint metadata (will be updated later)
+    dyn_state["restraint_metadata"] = {"time_varying": False, "restraints": {}}
 
     model_energy_unit = au.get_multiplier(model.energy_unit)
 
@@ -136,6 +141,23 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
     use_colvars = colvars_definitions is not None
     if use_colvars:
         colvars_calculators = setup_colvars(colvars_definitions)
+        
+    ### restraints
+    restraints_definitions = simulation_parameters.get("restraints", None)
+    use_restraints = restraints_definitions is not None
+    if use_restraints:
+        restraint_energies, restraint_forces, restraint_metadata = setup_restraints(restraints_definitions)
+        print(f"# Initialized {len(restraint_forces)} restraints")
+        if restraint_metadata["time_varying"]:
+            print(f"# Using time-varying force constants for {len(restraint_metadata['restraints'])} restraints")
+            for rname, rdata in restraint_metadata["restraints"].items():
+                fc_values = ", ".join([f"{fc:.2f}" for fc in rdata["force_constants"]])
+                print(f"#   {rname}: Force constants [{fc_values}], update every {rdata['update_steps']} steps")
+        
+        # Store restraint metadata in dynamics state
+        dyn_state["restraint_metadata"] = restraint_metadata
+    else:
+        restraint_energies, restraint_forces = {}, []
 
     ### ir spectrum
     do_ir_spectrum = simulation_parameters.get("ir_spectrum", False)
@@ -231,6 +253,48 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 epot = epot / model_energy_unit
                 f = f / model_energy_unit
                 new_sys = {**system, "forces": coords_to_eig(f), "epot": jnp.mean(epot)}
+            
+            # Apply restraints if any are defined
+            if use_restraints and len(restraint_forces) > 0:
+                # Use the current simulation step that was incremented at the beginning of the step function
+                # This is the correct step number that should be used for time-varying restraints
+                current_step = dyn_state['istep']
+                print(f"# STEP_DEBUG: Applying restraints at PIMD step {current_step}")
+                
+                # Get coordinates with correct shape for restraints
+                # For PIMD we use the centroid (first bead)
+                coords = system["coordinates"][0]
+                
+                # Use non-default parameter by explicitly naming it
+                # Using explicit parameter name avoids issues with JAX optimization
+                restraint_energy, restraint_force = apply_restraints(
+                    coordinates=coords, 
+                    restraint_forces=restraint_forces, 
+                    step=current_step
+                )
+                
+                # Add restraint energy to total potential energy
+                orig_epot = float(new_sys["epot"])
+                new_sys["epot"] = new_sys["epot"] + restraint_energy
+                print(f"# DEBUG: Updated epot: {orig_epot:.6f} -> {float(new_sys['epot']):.6f}")
+                
+                # Debug the forces
+                max_model_force = float(jnp.max(jnp.abs(new_sys["forces"])))
+                max_restraint_force = float(jnp.max(jnp.abs(restraint_force)))
+                print(f"# DEBUG: Max model force: {max_model_force:.6f}, Max restraint force: {max_restraint_force:.6f}")
+                
+                # Update forces with restraint forces (only for centroid)
+                restraint_force_eig = jnp.zeros_like(new_sys["forces"])
+                restraint_force_eig = restraint_force_eig.at[0].set(restraint_force)
+                new_sys["forces"] = new_sys["forces"] + restraint_force_eig
+                
+                # Check updated forces
+                max_updated_force = float(jnp.max(jnp.abs(new_sys["forces"])))
+                print(f"# DEBUG: Max updated force: {max_updated_force:.6f}")
+                
+                # Store restraint energy separately for reporting
+                new_sys["restraint_energy"] = restraint_energy
+            
             if ensemble_key is not None:
                 kT = system_data["kT"]
                 dE = (
@@ -243,10 +307,16 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 new_sys["total_dipole"] = jnp.mean(out["total_dipole"], axis=0)
 
             if use_colvars:
+                # Get the centroid coordinates with correct shape
                 coords = system["coordinates"][0]
+                
+                print(f"# DEBUG: Calculating colvars for PIMD with coords shape: {coords.shape}")
+                
                 colvars = {}
                 for colvar_name, colvar_calc in colvars_calculators.items():
-                    colvars[colvar_name] = colvar_calc(coords)
+                    value = colvar_calc(coords)
+                    colvars[colvar_name] = value
+                    print(f"# DEBUG: Colvar '{colvar_name}' = {float(value):.6f}")
                 new_sys["colvars"] = colvars
 
             return new_sys,out
@@ -310,15 +380,27 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
 
             return {**system, "coordinates": x, "vel": v}
 
+        # We'll use a simpler approach to optimize force calculation
+        # that avoids JIT problems with FrozenDict
+        
         @jax.jit
+        def _scale_forces_energy(forces, energy, virial=None):
+            """JIT-compiled function to scale forces and energy"""
+            forces = forces / model_energy_unit
+            energy = energy / model_energy_unit
+            if virial is not None:
+                virial = virial / model_energy_unit
+                return forces, energy, virial
+            return forces, energy
+        
         def update_forces(system, conformation):
+            # Compute forces with the appropriate method
             if estimate_pressure:
                 epot, f, vir_t, out = model._energy_and_forces_and_virial(
                     model.variables, conformation
                 )
-                epot = epot / model_energy_unit
-                f = f / model_energy_unit
-                vir_t = vir_t / model_energy_unit
+                # Scale with JIT-compiled function
+                f, epot, vir_t = _scale_forces_energy(f, epot, vir_t)
                 new_sys = {
                     **system,
                     "forces": f,
@@ -327,9 +409,59 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 }
             else:
                 epot, f, out = model._energy_and_forces(model.variables, conformation)
-                epot = epot / model_energy_unit
-                f = f / model_energy_unit
+                # Scale with JIT-compiled function
+                f, epot = _scale_forces_energy(f, epot)
                 new_sys = {**system, "forces": f, "epot": jnp.mean(epot)}
+            
+            # Apply restraints if any are defined
+            if use_restraints and len(restraint_forces) > 0:
+                # Use the current simulation step that was incremented at the beginning of the step function
+                # This is the correct step number that should be used for time-varying restraints
+                current_step = dyn_state['istep']
+                print(f"# STEP_DEBUG: Applying restraints at MD step {current_step}")
+                
+                # Get coordinates with correct shape for restraints
+                coords = system["coordinates"]
+                
+                # For replicas/beads, use the first one
+                if coords.ndim > 2:
+                    coords = coords[0]
+                    
+                # Use non-default parameter by explicitly naming it
+                # Using explicit parameter name avoids issues with JAX optimization
+                restraint_energy, restraint_force = apply_restraints(
+                    coordinates=coords, 
+                    restraint_forces=restraint_forces, 
+                    step=current_step
+                )
+                
+                # Add restraint energy to total potential energy
+                orig_epot = float(new_sys["epot"])
+                new_sys["epot"] = new_sys["epot"] + restraint_energy
+                print(f"# DEBUG: Updated epot: {orig_epot:.6f} -> {float(new_sys['epot']):.6f}")
+                
+                # Debug the forces
+                max_model_force = float(jnp.max(jnp.abs(new_sys["forces"])))
+                max_restraint_force = float(jnp.max(jnp.abs(restraint_force)))
+                print(f"# DEBUG: Max model force: {max_model_force:.6f}, Max restraint force: {max_restraint_force:.6f}")
+                
+                # Update forces with restraint forces
+                # For classical MD, add restraint forces to first replica's forces
+                if nreplicas > 1:
+                    print(f"# DEBUG: Multiple replicas ({nreplicas}), updating first replica forces")
+                    first_replica_forces = new_sys["forces"].reshape(nreplicas, nat, 3)[0]
+                    first_replica_forces = first_replica_forces + restraint_force
+                    new_sys["forces"] = new_sys["forces"].at[:nat].set(first_replica_forces)
+                else:
+                    print(f"# DEBUG: Single replica, directly adding restraint forces")
+                    new_sys["forces"] = new_sys["forces"] + restraint_force
+                
+                # Check updated forces
+                max_updated_force = float(jnp.max(jnp.abs(new_sys["forces"])))
+                print(f"# DEBUG: Max updated force: {max_updated_force:.6f}")
+                
+                # Store restraint energy separately for reporting
+                new_sys["restraint_energy"] = restraint_energy
 
             if ensemble_key is not None:
                 kT = system_data["kT"]
@@ -340,30 +472,50 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 new_sys["total_dipole"] = out["total_dipole"][0]
 
             if use_colvars:
-                coords = system["coordinates"][0]
+                # Get full coordinates with correct shape for colvars
+                coords = system["coordinates"]
+                
+                # For replicas/beads, use the first one
+                if coords.ndim > 2:
+                    coords = coords[0]
+                
+                print(f"# DEBUG: Calculating colvars with coords shape: {coords.shape}")
+                
                 colvars = {}
                 for colvar_name, colvar_calc in colvars_calculators.items():
-                    colvars[colvar_name] = colvar_calc(coords)
+                    value = colvar_calc(coords)
+                    colvars[colvar_name] = value
+                    print(f"# DEBUG: Colvar '{colvar_name}' = {float(value):.6f}")
                 new_sys["colvars"] = colvars
                 
             return new_sys,out
 
+        # Separate out the step B computational parts for JIT optimization
         @jax.jit
+        def _update_velocities_and_energy(v, f, dt2m, mass, corr_kin, nreplicas):
+            """JIT-optimized velocity and energy update"""
+            v = v + f * dt2m
+            ek_tensor = (
+                (0.5 / nreplicas / corr_kin)
+                * jnp.sum(mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0)
+            )
+            ek = jnp.trace(ek_tensor)
+            return v, ek, ek_tensor
+            
         def stepB(system):
             v = system["vel"]
             f = system["forces"]
             state_th = system["thermostat"]
-
-            v = v + f * dt2m
-            # ek = 0.5 * jnp.sum(mass[:, None] * v**2) / state_th.get("corr_kin", 1.0)
-            ek_tensor = (
-                (0.5 / nreplicas / state_th.get("corr_kin", 1.0) )
-                * jnp.sum(mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0)
+            
+            # Use the JIT-optimized function
+            v, ek, ek_tensor = _update_velocities_and_energy(
+                v, f, dt2m, mass, state_th.get("corr_kin", 1.0), nreplicas
             )
+            
             system = {
                 **system,
                 "vel": v,
-                "ek": jnp.trace(ek_tensor),
+                "ek": ek,
                 "ek_tensor": ek_tensor,
             }
 
@@ -451,10 +603,15 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
         tstep0 = time.time()
         print_timings = "timings" in dyn_state
 
+        # Increment the step counter first thing - very important for time-varying restraints
+        current_step = dyn_state["istep"] + 1
         dyn_state = {
             **dyn_state,
-            "istep": dyn_state["istep"] + 1,
+            "istep": current_step,
         }
+        
+        # Debug current step
+        print(f"# DEBUG: Starting integration step {current_step}")
         if print_timings:
             prev_timings = dyn_state["timings"]
             timings = defaultdict(lambda: 0.0)
@@ -478,27 +635,36 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
         
         ### update conformation and graphs
         nblist_countdown = dyn_state["nblist_countdown"]
+        
+        # Update conformation with new coordinates
+        updated_conformation = update_conformation(conformation, system)
+        
+        # Check if we need a full neighbor list update or if we can use skin updates
         if nblist_countdown <= 0 or force_preprocess or (istep < nblist_warmup):
-            ### full nblist update
+            ### FULL NEIGHBOR LIST UPDATE (with JIT)
+            
+            # Reset countdown
             dyn_state["nblist_countdown"] = nblist_stride - 1
-            conformation = model.preprocessing.process(
-                preproc_state, update_conformation(conformation, system)
+            
+            # Process the conformation without JIT because FrozenDict isn't hashable
+            processed_conf = model.preprocessing.process(preproc_state, updated_conformation)
+            # Check if we need to reallocate
+            preproc_state, state_up, conformation, overflow = model.preprocessing.check_reallocate(
+                preproc_state, processed_conf
             )
-            preproc_state, state_up, conformation, overflow = (
-                model.preprocessing.check_reallocate(preproc_state, conformation)
-            )
+            
             if nblist_verbose and overflow:
                 print("step", istep, ", nblist overflow => reallocating nblist")
                 print("size updates:", state_up)
 
+            # Handle IR spectrum if needed
             if do_ir_spectrum and model_ir is not None:
-                conformation_ir = model_ir.preprocessing.process(
-                    dyn_state["preproc_state_ir"], update_conformation_ir(dyn_state["conformation_ir"], system)
+                ir_conformation = update_conformation_ir(dyn_state["conformation_ir"], system)
+                # Process without JIT for compatibility
+                processed_conf_ir = model_ir.preprocessing.process(dyn_state["preproc_state_ir"], ir_conformation)
+                dyn_state["preproc_state_ir"], _, dyn_state["conformation_ir"], _ = model_ir.preprocessing.check_reallocate(
+                    dyn_state["preproc_state_ir"], processed_conf_ir
                 )
-                dyn_state["preproc_state_ir"], _, dyn_state["conformation_ir"], overflow = (
-                    model_ir.preprocessing.check_reallocate(dyn_state["preproc_state_ir"], conformation_ir)
-                )
-            
 
             if print_timings:
                 conformation["coordinates"].block_until_ready()
@@ -506,7 +672,7 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 tstep0 = time.time()
 
         else:
-            ### skin update
+            ### SKIN UPDATE (with JIT)
             if dyn_state["print_skin_activation"]:
                 if nblist_verbose:
                     print(
@@ -516,14 +682,17 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                     )
                 dyn_state["print_skin_activation"] = False
 
+            # Decrement countdown
             dyn_state["nblist_countdown"] = nblist_countdown - 1
-            conformation = model.preprocessing.update_skin(
-                update_conformation(conformation, system)
-            )
-            if do_ir_spectrum and model_ir is not None:
-                dyn_state["conformation_ir"] = model_ir.preprocessing.update_skin(
-                    update_conformation_ir(dyn_state["conformation_ir"], system)
-                )
+            
+            # Update skin without JIT for better compatibility with FrozenDict
+            conformation = model.preprocessing.update_skin(updated_conformation)
+            
+            # Handle IR spectrum if needed
+            if do_ir_spectrum and model_ir is not None:                
+                ir_conformation = update_conformation_ir(dyn_state["conformation_ir"], system)
+                # Update skin without JIT
+                dyn_state["conformation_ir"] = model_ir.preprocessing.update_skin(ir_conformation)
 
             if print_timings:
                 conformation["coordinates"].block_until_ready()

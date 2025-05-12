@@ -1,0 +1,46 @@
+Test Plan for Fixed Restraints Implementation
+
+I've made the following fixes to the restraints implementation:
+
+1. Fixed coordinate handling in distance_restraint_force, angle_restraint_force, and dihedral_restraint_force:
+   - Added code to check and reshape coordinates if they're not in the correct format
+   - Added safety checks to avoid division by zero in vector normalization
+   - Added better debugging output to identify issues
+
+2. Fixed coordinate access in integrate.py:
+   - Updated both the PIMD and classical MD update_forces functions 
+   - Fixed how coordinates are passed to the restraints functions
+   - Ensured proper coordinate dimensionality is maintained
+
+3. Enhanced colvar functions to handle coordinate reshaping correctly:
+   - Added an ensure_proper_coordinates helper function
+   - Made all colvar functions use this helper
+   - Added safety checks to avoid numerical issues
+
+To test the implementation, please:
+
+1. Make sure you've installed the updated code:
+   cd /Users/afrank/Downloads/FeNNol-main
+   pip install -e .
+
+2. Use the input_fixed_test.fnl file I created in the FeNNol-main directory:
+   cd /Users/afrank/Downloads/FeNNol-main
+   python -m fennol.md.dynamic input_fixed_test.fnl
+
+3. Look for these key indicators in the output:
+   - The coordinates for atoms 10 and 100 should be different
+   - The calculated distance should be non-zero
+   - The restraint energy should change during the simulation
+   - The restraint forces should be non-zero
+
+4. Try different atom pairs or force constants:
+   - Edit input_fixed_test.fnl to try different atom indices
+   - Increase force_constant to see stronger restraint effects
+   - Try flat_bottom style with a tolerance parameter
+
+Additional notes:
+- The debugging output should clearly show what's happening with each restraint
+- If there are still issues, the detailed output will help identify them
+- You may need to adjust atom indices depending on your specific system
+
+Let me know the results and if any further adjustments are needed!

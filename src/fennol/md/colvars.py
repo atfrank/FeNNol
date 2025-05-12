@@ -2,25 +2,61 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 
+def ensure_proper_coordinates(coordinates):
+    """Ensure coordinates have the correct shape [natoms, 3]"""
+    if coordinates.ndim == 1:
+        # If we have flattened coordinates, reshape them
+        natoms = coordinates.shape[0] // 3
+        return coordinates.reshape(natoms, 3)
+    return coordinates
+
 def colvar_distance(coordinates, atom1, atom2):
+    # Ensure proper shape
+    coordinates = ensure_proper_coordinates(coordinates)
     return jnp.linalg.norm(coordinates[atom1] - coordinates[atom2])
 
 def colvar_angle(coordinates, atom1, atom2, atom3):
+    # Ensure proper shape
+    coordinates = ensure_proper_coordinates(coordinates)
+    
     v1 = coordinates[atom1] - coordinates[atom2]
     v2 = coordinates[atom3] - coordinates[atom2]
-    v1 = v1 / jnp.linalg.norm(v1)
-    v2 = v2 / jnp.linalg.norm(v2)
-    return jnp.arccos(jnp.dot(v1, v2))
+    v1_norm = jnp.linalg.norm(v1)
+    v2_norm = jnp.linalg.norm(v2)
+    
+    # Avoid division by zero
+    v1_safe = v1 / jnp.maximum(v1_norm, 1e-10)
+    v2_safe = v2 / jnp.maximum(v2_norm, 1e-10)
+    
+    # Ensure dot product is within valid range for arccos
+    dot_product = jnp.dot(v1_safe, v2_safe)
+    dot_product = jnp.clip(dot_product, -0.9999999, 0.9999999)
+    
+    return jnp.arccos(dot_product)
 
 def colvar_dihedral(coordinates, atom1, atom2, atom3, atom4):
+    # Ensure proper shape
+    coordinates = ensure_proper_coordinates(coordinates)
+    
     v1 = coordinates[atom1] - coordinates[atom2]
     v2 = coordinates[atom3] - coordinates[atom2]
     v3 = coordinates[atom4] - coordinates[atom3]
+    
     n1 = jnp.cross(v1, v2)
     n2 = jnp.cross(v2, v3)
-    n1 = n1 / jnp.linalg.norm(n1)
-    n2 = n2 / jnp.linalg.norm(n2)
-    return jnp.arccos(jnp.dot(n1, n2))
+    
+    n1_norm = jnp.linalg.norm(n1)
+    n2_norm = jnp.linalg.norm(n2)
+    
+    # Avoid division by zero
+    n1_safe = n1 / jnp.maximum(n1_norm, 1e-10)
+    n2_safe = n2 / jnp.maximum(n2_norm, 1e-10)
+    
+    # Ensure dot product is within valid range for arccos
+    dot_product = jnp.dot(n1_safe, n2_safe)
+    dot_product = jnp.clip(dot_product, -0.9999999, 0.9999999)
+    
+    return jnp.arccos(dot_product)
 
 
 def setup_colvars(colvars_definitions):

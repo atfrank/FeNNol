@@ -5,7 +5,7 @@ from pathlib import Path
 import math
 
 import numpy as np
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any
 from collections import defaultdict
 from functools import partial
 import jax
@@ -28,6 +28,7 @@ from ..utils.atomic_units import AtomicUnits as au
 from ..utils.input_parser import parse_input
 from .initial import load_model, load_system_data, initialize_preprocessing
 from .integrate import initialize_dynamics
+from .minimize import minimize_system
 
 from copy import deepcopy
 
@@ -108,6 +109,45 @@ def dynamic(simulation_parameters, device, fprec):
     preproc_state, conformation = initialize_preprocessing(
         simulation_parameters, model, conformation, system_data
     )
+
+    # Check if we're performing minimization
+    run_minimization = simulation_parameters.get("minimize", False)
+    if run_minimization:
+        # Run minimization
+        print(f"# Starting energy minimization")
+        
+        # Determine the best minimization method for complex systems
+        if simulation_parameters.get("min_method", "").lower() in ["", "auto"]:
+            # Auto-select method based on system size
+            if len(conformation["coordinates"]) > 1000:
+                # For large systems (>1000 atoms), use the simple steepest descent
+                simulation_parameters["min_method"] = "simple_sd"
+                print("# Auto-selecting simple_sd minimizer for large system")
+            else:
+                # For smaller systems, use L-BFGS
+                simulation_parameters["min_method"] = "lbfgs"
+                print(f"# Auto-selecting lbfgs minimizer for system with {len(conformation['coordinates'])} atoms")
+                
+        # Default to simple_sd for RNA and complex biomolecules
+        if ("rna" in system_data.get("name", "").lower() or 
+            "dna" in system_data.get("name", "").lower() or 
+            "protein" in system_data.get("name", "").lower()):
+            if not simulation_parameters.get("min_method_override", False):
+                simulation_parameters["min_method"] = "simple_sd"
+                print("# Using simple_sd minimizer for nucleic acid/protein system")
+        
+        # Run the minimization
+        min_result = minimize_system(model, system_data, conformation, simulation_parameters, fprec)
+        
+        # Update conformation with minimized coordinates
+        conformation = {**conformation, "coordinates": min_result["coordinates"]}
+        
+        # If minimize_only is set, we're done
+        if simulation_parameters.get("minimize_only", False):
+            print("# Minimization complete. Exiting as minimize_only=True")
+            return
+        
+        print("# Minimization complete. Continuing with MD simulation...")
 
     random_seed = simulation_parameters.get(
         "random_seed", np.random.randint(0, 2**32 - 1)
@@ -228,6 +268,7 @@ def dynamic(simulation_parameters, device, fprec):
     pimd = dyn_state["pimd"]
     variable_cell = dyn_state["variable_cell"]
     nbeads = system_data.get("nbeads", 1)
+    use_restraints = "restraint_energy" in system
     dyn_name = "PIMD" if pimd else "MD"
     print("#" * 84)
     print(
@@ -238,6 +279,8 @@ def dynamic(simulation_parameters, device, fprec):
         header += "  Temp_c[K]"
     if include_thermostat_energy:
         header += "      Etherm"
+    if use_restraints:
+        header += "   Erestraint"
     if estimate_pressure:
         print_aniso_pressure = simulation_parameters.get("print_aniso_pressure", False)
         pressure_unit_str = simulation_parameters.get("pressure_unit", "atm")
@@ -317,6 +360,11 @@ def dynamic(simulation_parameters, device, fprec):
             if include_thermostat_energy:
                 etherm = th_state["thermostat_energy"]
                 etot = etot + etherm
+                
+            # Track restraint energy if present
+            has_restraints = "restraint_energy" in system
+            if has_restraints:
+                restraint_energy = system["restraint_energy"]
 
             properties_traj[f"Etot[{atom_energy_unit_str}]"].append(
                 etot * atom_energy_unit
@@ -328,6 +376,10 @@ def dynamic(simulation_parameters, device, fprec):
                 ek * atom_energy_unit
             )
             properties_traj["Temper[Kelvin]"].append(temper)
+            if has_restraints:
+                properties_traj[f"Erestraint[{atom_energy_unit_str}]"].append(
+                    restraint_energy * atom_energy_unit
+                )
             if pimd:
                 ek_c = system["ek_c"]
                 temper_c = 2 * ek_c / (3.0 * nat) * au.KELVIN
@@ -343,6 +395,8 @@ def dynamic(simulation_parameters, device, fprec):
                 properties_traj[f"Etherm[{atom_energy_unit_str}]"].append(
                     etherm * atom_energy_unit
                 )
+            if has_restraints:
+                line += f"  {restraint_energy*atom_energy_unit: #10.4f}"
             if estimate_pressure:
                 pres = system["pressure"] * pressure_unit
                 properties_traj[f"Pressure[{pressure_unit_str}]"].append(pres)
@@ -392,14 +446,85 @@ def dynamic(simulation_parameters, device, fprec):
             ### save colvars
             if "colvars" in system:
                 colvars = system["colvars"]
+                # Check if we have restraint energy information
+                has_restraint_energy = "restraint_energy" in system
+                
+                # Check if we have time-varying restraints
+                has_time_varying = False
+                time_varying_keys = []
+                if "restraint_metadata" in dyn_state and dyn_state["restraint_metadata"]["time_varying"]:
+                    has_time_varying = True
+                    # Get list of time-varying restraint names
+                    time_varying_keys = list(dyn_state["restraint_metadata"]["restraints"].keys())
+                
                 if fcolvars is None:
                     # open colvars file and print header
                     fcolvars = open(f"{system_name}.colvars", "a")
                     fcolvars.write("# time[ps]")
-                    fcolvars.write(" ".join(colvars.keys()))
+                    
+                    # Add colvar keys
+                    for key in colvars.keys():
+                        fcolvars.write(f" {key}")
+                    
+                    # Add restraint energy if available
+                    if has_restraint_energy:
+                        fcolvars.write(" restraint_energy")
+                    
+                    # Add time-varying force constant columns
+                    if has_time_varying:
+                        for key in time_varying_keys:
+                            fcolvars.write(f" {key}_force_constant")
+                        
                     fcolvars.write("\n")
+                
+                # Write time
                 fcolvars.write(f"{simulated_time:.3f} ")
+                
+                # Write colvar values
                 fcolvars.write(" ".join([f"{v:.6f}" for v in colvars.values()]))
+                
+                # Write restraint energy if available
+                if has_restraint_energy:
+                    fcolvars.write(f" {float(system['restraint_energy']):.6f}")
+                
+                # Write current force constant values for time-varying restraints
+                if has_time_varying:
+                    restraint_metadata = dyn_state["restraint_metadata"]
+                    
+                    # Check for global current_force_constants from restraints.py
+                    try:
+                        from fennol.md.restraints import current_force_constants, current_simulation_step
+                        # Always print force constants for every step for better debugging
+                        if current_force_constants:
+                            print(f"# =========== RESTRAINT FORCE CONSTANTS (MD STEP {istep}, GLOBAL STEP {current_simulation_step}) ===========")
+                            for name, value in current_force_constants.items():
+                                print(f"#   {name}: {value:.6f}")
+                            print(f"# ==========================================================================================")
+                                
+                        # Write the current force constants to the colvar file
+                        for key in time_varying_keys:
+                            if key in current_force_constants:
+                                fc_value = current_force_constants[key]
+                                fcolvars.write(f" {fc_value:.6f}")
+                            elif "current_fc" in restraint_metadata["restraints"][key]:
+                                fc_value = restraint_metadata["restraints"][key]["current_fc"]
+                                fcolvars.write(f" {fc_value:.6f}")
+                            else:
+                                # If current_fc not available yet, use the initial value
+                                fc_value = restraint_metadata["restraints"][key]["force_constants"][0]
+                                fcolvars.write(f" {fc_value:.6f}")
+                                
+                    except (ImportError, NameError):
+                        # Fallback to using metadata if the global variable approach doesn't work
+                        for key in time_varying_keys:
+                            if "current_fc" in restraint_metadata["restraints"][key]:
+                                fc_value = restraint_metadata["restraints"][key]["current_fc"]
+                                fcolvars.write(f" {fc_value:.6f}")
+                            else:
+                                # If current_fc not available yet, use the initial value
+                                fc_value = restraint_metadata["restraints"][key]["force_constants"][0]
+                                fcolvars.write(f" {fc_value:.6f}")
+                    
                 fcolvars.write("\n")
                 fcolvars.flush()
 
