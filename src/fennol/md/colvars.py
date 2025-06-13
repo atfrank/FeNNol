@@ -58,6 +58,33 @@ def colvar_dihedral(coordinates, atom1, atom2, atom3, atom4):
     
     return jnp.arccos(dot_product)
 
+def colvar_sphere_distance(coordinates, atom_indices, center):
+    """
+    Calculate the distance of atoms from a spherical boundary center.
+    
+    Args:
+        coordinates: Atomic coordinates [n_atoms, 3]
+        atom_indices: Indices of atoms to calculate distance for (can be single int or array)
+        center: Center of the sphere [x, y, z]
+    
+    Returns:
+        Distance(s) from center (scalar if single atom, array if multiple)
+    """
+    # Ensure proper shape
+    coordinates = ensure_proper_coordinates(coordinates)
+    
+    # Convert center to jnp array if needed
+    center = jnp.array(center)
+    
+    # Handle single atom or multiple atoms
+    if isinstance(atom_indices, int):
+        atom_pos = coordinates[atom_indices]
+        return jnp.linalg.norm(atom_pos - center)
+    else:
+        atom_indices = jnp.array(atom_indices)
+        atom_positions = coordinates[atom_indices]
+        return jnp.linalg.norm(atom_positions - center[None, :], axis=1)
+
 
 def setup_colvars(colvars_definitions):
     colvars = {}

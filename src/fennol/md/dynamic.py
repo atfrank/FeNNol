@@ -473,7 +473,15 @@ def dynamic(simulation_parameters, device, fprec):
                     # Add time-varying force constant columns
                     if has_time_varying:
                         for key in time_varying_keys:
-                            fcolvars.write(f" {key}_force_constant")
+                            rdata = dyn_state["restraint_metadata"]["restraints"][key]
+                            if "force_constants" in rdata:
+                                fcolvars.write(f" {key}_force_constant")
+                            else:
+                                # Handle backside_attack restraints with separate force constants
+                                if "angle_force_constants" in rdata:
+                                    fcolvars.write(f" {key}_angle_force_constant")
+                                if "distance_force_constants" in rdata and rdata["distance_force_constants"] is not None:
+                                    fcolvars.write(f" {key}_distance_force_constant")
                         
                     fcolvars.write("\n")
                 
@@ -494,36 +502,49 @@ def dynamic(simulation_parameters, device, fprec):
                     # Check for global current_force_constants from restraints.py
                     try:
                         from fennol.md.restraints import current_force_constants, current_simulation_step
-                        # Always print force constants for every step for better debugging
-                        if current_force_constants:
-                            print(f"# =========== RESTRAINT FORCE CONSTANTS (MD STEP {istep}, GLOBAL STEP {current_simulation_step}) ===========")
-                            for name, value in current_force_constants.items():
-                                print(f"#   {name}: {value:.6f}")
-                            print(f"# ==========================================================================================")
-                                
                         # Write the current force constants to the colvar file
                         for key in time_varying_keys:
+                            rdata = restraint_metadata["restraints"][key]
                             if key in current_force_constants:
                                 fc_value = current_force_constants[key]
                                 fcolvars.write(f" {fc_value:.6f}")
-                            elif "current_fc" in restraint_metadata["restraints"][key]:
-                                fc_value = restraint_metadata["restraints"][key]["current_fc"]
+                            elif "current_fc" in rdata:
+                                fc_value = rdata["current_fc"]
                                 fcolvars.write(f" {fc_value:.6f}")
                             else:
                                 # If current_fc not available yet, use the initial value
-                                fc_value = restraint_metadata["restraints"][key]["force_constants"][0]
-                                fcolvars.write(f" {fc_value:.6f}")
+                                if "force_constants" in rdata:
+                                    fc_value = rdata["force_constants"][0]
+                                    fcolvars.write(f" {fc_value:.6f}")
+                                else:
+                                    # Handle backside_attack restraints
+                                    if "angle_force_constants" in rdata:
+                                        fc_value = rdata["angle_force_constants"][0]
+                                        fcolvars.write(f" {fc_value:.6f}")
+                                    if "distance_force_constants" in rdata and rdata["distance_force_constants"] is not None:
+                                        fc_value = rdata["distance_force_constants"][0]
+                                        fcolvars.write(f" {fc_value:.6f}")
                                 
                     except (ImportError, NameError):
                         # Fallback to using metadata if the global variable approach doesn't work
                         for key in time_varying_keys:
-                            if "current_fc" in restraint_metadata["restraints"][key]:
-                                fc_value = restraint_metadata["restraints"][key]["current_fc"]
+                            rdata = restraint_metadata["restraints"][key]
+                            if "current_fc" in rdata:
+                                fc_value = rdata["current_fc"]
                                 fcolvars.write(f" {fc_value:.6f}")
                             else:
                                 # If current_fc not available yet, use the initial value
-                                fc_value = restraint_metadata["restraints"][key]["force_constants"][0]
-                                fcolvars.write(f" {fc_value:.6f}")
+                                if "force_constants" in rdata:
+                                    fc_value = rdata["force_constants"][0]
+                                    fcolvars.write(f" {fc_value:.6f}")
+                                else:
+                                    # Handle backside_attack restraints
+                                    if "angle_force_constants" in rdata:
+                                        fc_value = rdata["angle_force_constants"][0]
+                                        fcolvars.write(f" {fc_value:.6f}")
+                                    if "distance_force_constants" in rdata and rdata["distance_force_constants"] is not None:
+                                        fc_value = rdata["distance_force_constants"][0]
+                                        fcolvars.write(f" {fc_value:.6f}")
                     
                 fcolvars.write("\n")
                 fcolvars.flush()
@@ -669,6 +690,10 @@ def dynamic(simulation_parameters, device, fprec):
             properties_traj = defaultdict(list)
 
     print(f"# Run done in {human_time_duration(time.time()-tstart_dyn)}")
+    
+    # PMF calculation has been moved to post-processing
+    # Use calculate_pmf_post.py to analyze reaction coordinate data
+    
     ### close trajectory file
     fout.close()
     if ensemble_key is not None:

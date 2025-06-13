@@ -62,6 +62,17 @@ To learn how to train a FeNNol model, you can check the examples in the [`exampl
 
 To learn how to run molecular dynamics simulations with FeNNol models, you can check the examples in the [`examples/md`](https://github.com/thomasple/FeNNol/tree/main/examples/md) directory. The `README.md` file in that directory contains instructions on how to run simulations with the provided ANI-2x model.
 
+### Featured Capabilities
+
+#### Backside Attack Restraints
+FeNNol includes specialized restraints for SN2 reaction simulations. The backside attack restraint enforces linear approach geometry and can include distance components for complete reaction control. See [backside attack documentation](docs/restraints/BACKSIDE_ATTACK.md) for details and examples.
+
+#### RMSD Restraints
+FeNNol supports Root Mean Square Deviation (RMSD) restraints for maintaining structure similarity to reference coordinates. This is useful for controlled conformational sampling and structural refinement.
+
+#### PMF Calculations
+FeNNol provides tools for Potential of Mean Force (PMF) calculations to study free energy profiles along reaction coordinates.
+
 
 ## Citation
 

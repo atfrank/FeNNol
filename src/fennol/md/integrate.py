@@ -35,7 +35,7 @@ def initialize_dynamics(
     simulation_parameters, system_data, conformation, model, fprec, rng_key
 ):
     step, update_conformation, dyn_state, thermo_state, vel = initialize_integrator(
-        simulation_parameters, system_data, model, fprec, rng_key
+        simulation_parameters, system_data, conformation, model, fprec, rng_key
     )
     ### initialize system
     system = initialize_system(
@@ -49,7 +49,7 @@ def initialize_dynamics(
     return step, update_conformation, dyn_state, {**system, **thermo_state}
 
 
-def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_key):
+def initialize_integrator(simulation_parameters, system_data, conformation, model, fprec, rng_key):
     dt = simulation_parameters.get("dt") * au.FS
     dt2 = 0.5 * dt
     nbeads = system_data.get("nbeads", None)
@@ -146,13 +146,46 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
     restraints_definitions = simulation_parameters.get("restraints", None)
     use_restraints = restraints_definitions is not None
     if use_restraints:
-        restraint_energies, restraint_forces, restraint_metadata = setup_restraints(restraints_definitions)
+        # Check if restraint debug is enabled
+        restraint_debug = simulation_parameters.get("restraint_debug", False)
+        # Handle both boolean and string values
+        if isinstance(restraint_debug, str):
+            restraint_debug = restraint_debug.lower() in ['true', 'yes', '1', 'on']
+        if restraint_debug:
+            from fennol.md import restraints
+            restraints.restraint_debug_enabled = True
+            print("# Restraint debug mode enabled")
+        
+        # Get nsteps for auto-calculating update_steps
+        nsteps = simulation_parameters.get("nsteps", None)
+        if nsteps is not None:
+            nsteps = int(nsteps)
+        # Pass initial coordinates and symbols for PDB-based selection and auto-center
+        initial_coords = conformation["coordinates"] if "coordinates" in conformation else None
+        atom_symbols = system_data.get("symbols", None)
+        restraint_energies, restraint_forces, restraint_metadata = setup_restraints(
+            restraints_definitions, nsteps, initial_coords, None, atom_symbols
+        )
         print(f"# Initialized {len(restraint_forces)} restraints")
         if restraint_metadata["time_varying"]:
             print(f"# Using time-varying force constants for {len(restraint_metadata['restraints'])} restraints")
             for rname, rdata in restraint_metadata["restraints"].items():
-                fc_values = ", ".join([f"{fc:.2f}" for fc in rdata["force_constants"]])
-                print(f"#   {rname}: Force constants [{fc_values}], update every {rdata['update_steps']} steps")
+                # Handle both regular restraints and backside_attack restraints
+                if "force_constants" in rdata:
+                    fc_values = ", ".join([f"{fc:.2f}" for fc in rdata["force_constants"]])
+                    print(f"#   {rname}: Force constants [{fc_values}], update every {rdata['update_steps']} steps")
+                else:
+                    # Handle backside_attack restraints with separate angle and distance force constants
+                    if "angle_force_constants" in rdata:
+                        angle_fc_values = ", ".join([f"{fc:.2f}" for fc in rdata["angle_force_constants"]])
+                        print(f"#   {rname}: Angle force constants [{angle_fc_values}]")
+                    if "distance_force_constants" in rdata and rdata["distance_force_constants"] is not None:
+                        dist_fc_values = ", ".join([f"{fc:.2f}" for fc in rdata["distance_force_constants"]])
+                        print(f"#              Distance force constants [{dist_fc_values}]")
+                    if 'update_steps' in rdata:
+                        print(f"#              Update every {rdata['update_steps']} steps")
+                    elif rdata.get('type') == 'adaptive_sn2':
+                        print(f"#              Adaptive over {rdata['simulation_steps']} steps")
         
         # Store restraint metadata in dynamics state
         dyn_state["restraint_metadata"] = restraint_metadata
@@ -259,7 +292,6 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 # Use the current simulation step that was incremented at the beginning of the step function
                 # This is the correct step number that should be used for time-varying restraints
                 current_step = dyn_state['istep']
-                print(f"# STEP_DEBUG: Applying restraints at PIMD step {current_step}")
                 
                 # Get coordinates with correct shape for restraints
                 # For PIMD we use the centroid (first bead)
@@ -274,23 +306,12 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 )
                 
                 # Add restraint energy to total potential energy
-                orig_epot = float(new_sys["epot"])
                 new_sys["epot"] = new_sys["epot"] + restraint_energy
-                print(f"# DEBUG: Updated epot: {orig_epot:.6f} -> {float(new_sys['epot']):.6f}")
-                
-                # Debug the forces
-                max_model_force = float(jnp.max(jnp.abs(new_sys["forces"])))
-                max_restraint_force = float(jnp.max(jnp.abs(restraint_force)))
-                print(f"# DEBUG: Max model force: {max_model_force:.6f}, Max restraint force: {max_restraint_force:.6f}")
                 
                 # Update forces with restraint forces (only for centroid)
                 restraint_force_eig = jnp.zeros_like(new_sys["forces"])
                 restraint_force_eig = restraint_force_eig.at[0].set(restraint_force)
                 new_sys["forces"] = new_sys["forces"] + restraint_force_eig
-                
-                # Check updated forces
-                max_updated_force = float(jnp.max(jnp.abs(new_sys["forces"])))
-                print(f"# DEBUG: Max updated force: {max_updated_force:.6f}")
                 
                 # Store restraint energy separately for reporting
                 new_sys["restraint_energy"] = restraint_energy
@@ -310,13 +331,10 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 # Get the centroid coordinates with correct shape
                 coords = system["coordinates"][0]
                 
-                print(f"# DEBUG: Calculating colvars for PIMD with coords shape: {coords.shape}")
-                
                 colvars = {}
                 for colvar_name, colvar_calc in colvars_calculators.items():
                     value = colvar_calc(coords)
                     colvars[colvar_name] = value
-                    print(f"# DEBUG: Colvar '{colvar_name}' = {float(value):.6f}")
                 new_sys["colvars"] = colvars
 
             return new_sys,out
@@ -418,7 +436,6 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 # Use the current simulation step that was incremented at the beginning of the step function
                 # This is the correct step number that should be used for time-varying restraints
                 current_step = dyn_state['istep']
-                print(f"# STEP_DEBUG: Applying restraints at MD step {current_step}")
                 
                 # Get coordinates with correct shape for restraints
                 coords = system["coordinates"]
@@ -436,29 +453,16 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 )
                 
                 # Add restraint energy to total potential energy
-                orig_epot = float(new_sys["epot"])
                 new_sys["epot"] = new_sys["epot"] + restraint_energy
-                print(f"# DEBUG: Updated epot: {orig_epot:.6f} -> {float(new_sys['epot']):.6f}")
-                
-                # Debug the forces
-                max_model_force = float(jnp.max(jnp.abs(new_sys["forces"])))
-                max_restraint_force = float(jnp.max(jnp.abs(restraint_force)))
-                print(f"# DEBUG: Max model force: {max_model_force:.6f}, Max restraint force: {max_restraint_force:.6f}")
                 
                 # Update forces with restraint forces
                 # For classical MD, add restraint forces to first replica's forces
                 if nreplicas > 1:
-                    print(f"# DEBUG: Multiple replicas ({nreplicas}), updating first replica forces")
                     first_replica_forces = new_sys["forces"].reshape(nreplicas, nat, 3)[0]
                     first_replica_forces = first_replica_forces + restraint_force
                     new_sys["forces"] = new_sys["forces"].at[:nat].set(first_replica_forces)
                 else:
-                    print(f"# DEBUG: Single replica, directly adding restraint forces")
                     new_sys["forces"] = new_sys["forces"] + restraint_force
-                
-                # Check updated forces
-                max_updated_force = float(jnp.max(jnp.abs(new_sys["forces"])))
-                print(f"# DEBUG: Max updated force: {max_updated_force:.6f}")
                 
                 # Store restraint energy separately for reporting
                 new_sys["restraint_energy"] = restraint_energy
@@ -479,13 +483,10 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
                 if coords.ndim > 2:
                     coords = coords[0]
                 
-                print(f"# DEBUG: Calculating colvars with coords shape: {coords.shape}")
-                
                 colvars = {}
                 for colvar_name, colvar_calc in colvars_calculators.items():
                     value = colvar_calc(coords)
                     colvars[colvar_name] = value
-                    print(f"# DEBUG: Colvar '{colvar_name}' = {float(value):.6f}")
                 new_sys["colvars"] = colvars
                 
             return new_sys,out
@@ -610,8 +611,6 @@ def initialize_integrator(simulation_parameters, system_data, model, fprec, rng_
             "istep": current_step,
         }
         
-        # Debug current step
-        print(f"# DEBUG: Starting integration step {current_step}")
         if print_timings:
             prev_timings = dyn_state["timings"]
             timings = defaultdict(lambda: 0.0)
