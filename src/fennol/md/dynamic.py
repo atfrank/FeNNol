@@ -29,6 +29,7 @@ from ..utils.input_parser import parse_input
 from .initial import load_model, load_system_data, initialize_preprocessing
 from .integrate import initialize_dynamics
 from .minimize import minimize_system
+from .transition_state import find_transition_state
 
 from copy import deepcopy
 
@@ -110,6 +111,25 @@ def dynamic(simulation_parameters, device, fprec):
         simulation_parameters, model, conformation, system_data
     )
 
+    # Check if we're performing transition state search
+    run_ts_search = simulation_parameters.get("transition_state", False)
+    if run_ts_search:
+        # Run transition state optimization
+        print(f"# Starting transition state optimization")
+        
+        # Run the TS optimization
+        ts_result = find_transition_state(model, system_data, conformation, simulation_parameters, fprec)
+        
+        # Update conformation with TS coordinates
+        conformation = {**conformation, "coordinates": ts_result["coordinates"]}
+        
+        # If ts_only is set, we're done
+        if simulation_parameters.get("ts_only", False):
+            print("# Transition state optimization complete. Exiting as ts_only=True")
+            return
+        
+        print("# Transition state optimization complete. Continuing with MD simulation...")
+    
     # Check if we're performing minimization
     run_minimization = simulation_parameters.get("minimize", False)
     if run_minimization:
