@@ -1,0 +1,289 @@
+REMARK Transition State Optimization Trajectory
+REMARK Method: sn2
+REMARK System: sn2_symmetric
+MODEL        0
+REMARK energy: -0.7880483865737915
+REMARK step: 0
+REMARK energy_unit: Ha
+REMARK max_force: 0.09607601165771484
+REMARK rms_force: 0.04248505085706711
+ATOM      1  F   UNK A   1      -2.200   0.000   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.000   0.000   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1       0.000   1.090   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.943  -0.545   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -0.943  -0.545   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.200   0.000   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        1
+REMARK energy: -0.7940896153450012
+REMARK step: 1
+REMARK energy_unit: Ha
+REMARK max_force: 0.06693054735660553
+REMARK rms_force: 0.02804723009467125
+ATOM      1  F   UNK A   1      -2.189  -0.005   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.006   0.029   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.002   1.086   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.941  -0.568   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -0.969  -0.550   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.211   0.008   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        2
+REMARK energy: -0.7990822196006775
+REMARK step: 2
+REMARK energy_unit: Ha
+REMARK max_force: 0.049994926899671555
+REMARK rms_force: 0.023536890745162964
+ATOM      1  F   UNK A   1      -2.175  -0.016   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.022   0.033   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.005   1.103   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.932  -0.597   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -0.999  -0.545   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.225   0.021   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        3
+REMARK energy: -0.8040952086448669
+REMARK step: 3
+REMARK energy_unit: Ha
+REMARK max_force: 0.04297706484794617
+REMARK rms_force: 0.023168964311480522
+ATOM      1  F   UNK A   1      -2.166  -0.032   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.046   0.041   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.007   1.111   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.923  -0.628   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.029  -0.527   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.234   0.036   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        4
+REMARK energy: -0.8097994327545166
+REMARK step: 4
+REMARK energy_unit: Ha
+REMARK max_force: 0.047407567501068115
+REMARK rms_force: 0.0241540614515543
+ATOM      1  F   UNK A   1      -2.162  -0.051   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.080   0.041   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.008   1.118   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.911  -0.659   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.057  -0.501   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.237   0.052   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        5
+REMARK energy: -0.8161632418632507
+REMARK step: 5
+REMARK energy_unit: Ha
+REMARK max_force: 0.05199645459651947
+REMARK rms_force: 0.024920234456658363
+ATOM      1  F   UNK A   1      -2.161  -0.071   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.113   0.056   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.004   1.115   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.901  -0.699   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.085  -0.473   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.236   0.073   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        6
+REMARK energy: -0.8161632418632507
+REMARK step: 6
+REMARK energy_unit: Ha
+REMARK max_force: 0.05199645459651947
+REMARK rms_force: 0.024920234456658363
+ATOM      1  F   UNK A   1      -2.161  -0.071   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.113   0.056   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.004   1.115   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.901  -0.699   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.085  -0.473   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.236   0.073   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        7
+REMARK energy: -0.8167155385017395
+REMARK step: 7
+REMARK energy_unit: Ha
+REMARK max_force: 0.06525371223688126
+REMARK rms_force: 0.029951395466923714
+ATOM      1  F   UNK A   1      -2.135  -0.079   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.136   0.047   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.002   1.123   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.891  -0.717   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.096  -0.459   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.206   0.085   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        8
+REMARK energy: -0.8167155385017395
+REMARK step: 8
+REMARK energy_unit: Ha
+REMARK max_force: 0.06525371223688126
+REMARK rms_force: 0.029951395466923714
+ATOM      1  F   UNK A   1      -2.135  -0.079   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.136   0.047   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.002   1.123   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.891  -0.717   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.096  -0.459   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.206   0.085   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL        9
+REMARK energy: -0.8167155385017395
+REMARK step: 9
+REMARK energy_unit: Ha
+REMARK max_force: 0.06525371223688126
+REMARK rms_force: 0.029951395466923714
+ATOM      1  F   UNK A   1      -2.135  -0.079   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.136   0.047   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.002   1.123   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.891  -0.717   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.096  -0.459   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.206   0.085   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       10
+REMARK energy: -0.8167492151260376
+REMARK step: 10
+REMARK energy_unit: Ha
+REMARK max_force: 0.0719875916838646
+REMARK rms_force: 0.031134696677327156
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.140   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.889  -0.724   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.197   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       11
+REMARK energy: -0.8167492151260376
+REMARK step: 11
+REMARK energy_unit: Ha
+REMARK max_force: 0.0719875916838646
+REMARK rms_force: 0.031134696677327156
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.140   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.889  -0.724   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.197   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       12
+REMARK energy: -0.8167492151260376
+REMARK step: 12
+REMARK energy_unit: Ha
+REMARK max_force: 0.0719875916838646
+REMARK rms_force: 0.031134696677327156
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.140   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.889  -0.724   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.197   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       13
+REMARK energy: -0.8167492151260376
+REMARK step: 13
+REMARK energy_unit: Ha
+REMARK max_force: 0.0719875916838646
+REMARK rms_force: 0.031134696677327156
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.140   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.889  -0.724   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.197   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       14
+REMARK energy: -0.8167492151260376
+REMARK step: 14
+REMARK energy_unit: Ha
+REMARK max_force: 0.0719875916838646
+REMARK rms_force: 0.031134696677327156
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.140   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.889  -0.724   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.197   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       15
+REMARK energy: -0.8167493939399719
+REMARK step: 15
+REMARK energy_unit: Ha
+REMARK max_force: 0.07241254299879074
+REMARK rms_force: 0.031232211738824844
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.141   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.888  -0.725   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.196   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       16
+REMARK energy: -0.8167493939399719
+REMARK step: 16
+REMARK energy_unit: Ha
+REMARK max_force: 0.07241254299879074
+REMARK rms_force: 0.031232211738824844
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.141   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.888  -0.725   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.196   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       17
+REMARK energy: -0.8167493939399719
+REMARK step: 17
+REMARK energy_unit: Ha
+REMARK max_force: 0.07241254299879074
+REMARK rms_force: 0.031232211738824844
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.141   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.888  -0.725   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.196   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       18
+REMARK energy: -0.8167493939399719
+REMARK step: 18
+REMARK energy_unit: Ha
+REMARK max_force: 0.07241254299879074
+REMARK rms_force: 0.031232211738824844
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.141   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.888  -0.725   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.196   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       19
+REMARK energy: -0.8167493939399719
+REMARK step: 19
+REMARK energy_unit: Ha
+REMARK max_force: 0.07241254299879074
+REMARK rms_force: 0.031232211738824844
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.141   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.888  -0.725   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.196   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       20
+REMARK energy: -0.8167493939399719
+REMARK step: 20
+REMARK energy_unit: Ha
+REMARK max_force: 0.07241254299879074
+REMARK rms_force: 0.031232211738824844
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.141   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.888  -0.725   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.196   0.089   0.000  1.00  0.00           Cl
+ENDMDL
+MODEL       20
+REMARK energy: -0.8167493939399719
+REMARK step: 20
+REMARK energy_unit: Ha
+REMARK max_force: 0.07241254299879074
+REMARK rms_force: 0.031232211738824844
+ATOM      1  F   UNK A   1      -2.127  -0.081   0.000  1.00  0.00            F
+ATOM      2  C   UNK A   1       0.141   0.050   0.000  1.00  0.00            C
+ATOM      3  H   UNK A   1      -0.001   1.122   0.000  1.00  0.00            H
+ATOM      4  H   UNK A   1       0.888  -0.725   0.000  1.00  0.00            H
+ATOM      5  H   UNK A   1      -1.097  -0.456   0.000  1.00  0.00            H
+ATOM      6  Cl  UNK A   1       2.196   0.089   0.000  1.00  0.00           Cl
+ENDMDL

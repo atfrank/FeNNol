@@ -1,0 +1,13 @@
+REMARK Best Transition State Guess
+REMARK Method: dimer
+REMARK System: h2_ts_guess
+MODEL        3
+REMARK energy: -0.17274737358093262
+REMARK step: 3
+REMARK energy_unit: Ha
+REMARK description: Best TS guess
+REMARK max_force: 0.20046867430210114
+REMARK rms_force: 0.11574074625968933
+ATOM      1  H   UNK A   1      -0.016   0.009   0.013  1.00  0.00            H
+ATOM      2  H   UNK A   1       1.222   0.008   0.013  1.00  0.00            H
+ENDMDL

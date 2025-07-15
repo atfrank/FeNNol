@@ -1,0 +1,17 @@
+REMARK Best Transition State Guess
+REMARK Method: quasi_newton
+REMARK System: water_dimer_ts
+MODEL        0
+REMARK energy: -1.0418602228164673
+REMARK step: 0
+REMARK energy_unit: Ha
+REMARK description: Best TS guess
+REMARK max_force: 0.034967586398124695
+REMARK rms_force: 0.018652817234396935
+ATOM      1  O   UNK A   1       0.000   0.000   0.000  1.00  0.00            O
+ATOM      2  H   UNK A   1       0.957   0.000   0.000  1.00  0.00            H
+ATOM      3  H   UNK A   1      -0.240   0.927   0.000  1.00  0.00            H
+ATOM      4  O   UNK A   1       2.800   0.000   0.000  1.00  0.00            O
+ATOM      5  H   UNK A   1       3.757   0.000   0.000  1.00  0.00            H
+ATOM      6  H   UNK A   1       2.560   0.927   0.000  1.00  0.00            H
+ENDMDL
