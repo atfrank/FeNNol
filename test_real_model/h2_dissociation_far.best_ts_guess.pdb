@@ -1,0 +1,13 @@
+REMARK Best Transition State Guess
+REMARK Method: dimer
+REMARK System: h2_dissociation_far
+MODEL        7
+REMARK energy: -0.07983136177062988
+REMARK step: 7
+REMARK energy_unit: Ha
+REMARK description: Best TS guess
+REMARK max_force: 0.0009061000309884548
+REMARK rms_force: 0.0005232038092799485
+ATOM      1  H   UNK A   1      -0.089  -0.039  -0.025  1.00  0.00            H
+ATOM      2  H   UNK A   1       3.079   0.011  -0.018  1.00  0.00            H
+ENDMDL

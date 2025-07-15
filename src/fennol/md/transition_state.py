@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from typing import Dict, Any, Optional, Tuple, List
 from functools import partial
 
-from ..utils.io import write_xyz_frame, write_extxyz_frame, write_arc_frame, human_time_duration
+from ..utils.io import write_xyz_frame, write_extxyz_frame, write_arc_frame, write_multimodel_xyz_frame, write_pdb_frame, human_time_duration
 from ..utils.atomic_units import AtomicUnits as au
 from .minimize import Minimizer
 from .energy_formatter import format_energy_for_display
@@ -50,6 +50,16 @@ class TransitionStateOptimizer(Minimizer):
         
         # For tracking negative eigenvalues
         self.target_n_negative = 1  # First-order saddle point
+        
+        # Track best TS guess
+        self.best_ts_energy = float('inf')
+        self.best_ts_coords = None
+        self.best_ts_forces = None
+        self.best_ts_iteration = 0
+        
+        # Enhanced trajectory writing
+        self.write_multimodel_trajectory = simulation_parameters.get("write_multimodel_trajectory", True)
+        self.write_pdb_trajectory = simulation_parameters.get("write_pdb_trajectory", True)
         
     def print_header(self):
         """Print the transition state optimization header"""
@@ -100,6 +110,139 @@ class TransitionStateOptimizer(Minimizer):
             line += f"  {step_time:10.4f}s"
             
         print(line)
+        
+    def update_best_ts_guess(self, coords, energy, forces, iteration):
+        """Update the best TS guess based on criteria"""
+        energy_val = self._safe_get_energy_value(energy)
+        
+        # For TS, we want the highest energy point (closest to saddle point)
+        # but also consider force magnitude (lower is better)
+        max_force = jnp.max(jnp.abs(forces))
+        
+        # Simple scoring: prioritize low forces, then high energy
+        # This is a heuristic - in practice, you might want more sophisticated criteria
+        current_score = energy_val - 10 * max_force  # Weight forces heavily
+        best_score = self.best_ts_energy - 10 * jnp.max(jnp.abs(self.best_ts_forces)) if self.best_ts_forces is not None else float('-inf')
+        
+        if current_score > best_score:
+            self.best_ts_energy = energy_val
+            self.best_ts_coords = coords.copy()
+            self.best_ts_forces = forces.copy()
+            self.best_ts_iteration = iteration
+    
+    def save_enhanced_trajectory(self, coords, iteration, energy, forces=None, properties=None):
+        """Save trajectory in multiple formats"""
+        # Save standard trajectory
+        self.save_trajectory(coords, iteration, energy, forces, properties)
+        
+        # Update best TS guess
+        if forces is not None:
+            self.update_best_ts_guess(coords, energy, forces, iteration)
+        
+        # Prepare enhanced properties
+        if properties is None:
+            properties = {}
+        
+        properties["energy"] = float(energy) * self.model_energy_unit
+        properties["step"] = iteration
+        properties["energy_unit"] = self.model.energy_unit
+        
+        if forces is not None:
+            max_force = jnp.max(jnp.abs(forces))
+            rms_force = jnp.sqrt(jnp.mean(forces**2))
+            properties["max_force"] = float(max_force) * self.model_energy_unit
+            properties["rms_force"] = float(rms_force) * self.model_energy_unit
+        
+        # Get cell if PBC is being used
+        cell = None
+        if self.system_data.get("pbc") is not None:
+            if "cell" in self.system_data["pbc"]:
+                cell = self.system_data["pbc"]["cell"]
+            elif "cells" in self.conformation:
+                cell = self.conformation["cells"][0]
+        
+        coords_reshaped = coords.reshape(-1, 3)
+        
+        # Write multi-model XYZ trajectory
+        if self.write_multimodel_trajectory:
+            multimodel_xyz_file = f"{self.output_prefix}.multimodel.xyz"
+            mode = "a" if iteration > 0 else "w"
+            with open(multimodel_xyz_file, mode) as f:
+                write_multimodel_xyz_frame(
+                    f,
+                    self.system_data["symbols"],
+                    coords_reshaped,
+                    properties=properties,
+                    frame_id=iteration
+                )
+        
+        # Write PDB trajectory
+        if self.write_pdb_trajectory:
+            pdb_file = f"{self.output_prefix}.traj.pdb"
+            mode = "a" if iteration > 0 else "w"
+            with open(pdb_file, mode) as f:
+                if iteration == 0:
+                    f.write("REMARK Transition State Optimization Trajectory\n")
+                    f.write(f"REMARK Method: {self.ts_method}\n")
+                    f.write(f"REMARK System: {self.system_data['name']}\n")
+                
+                write_pdb_frame(
+                    f,
+                    self.system_data["symbols"],
+                    coords_reshaped,
+                    properties=properties,
+                    frame_id=iteration
+                )
+    
+    def save_best_ts_guess(self):
+        """Save the best TS guess found during optimization"""
+        if self.best_ts_coords is None:
+            return
+        
+        # Prepare properties for best TS guess
+        properties = {
+            "energy": float(self.best_ts_energy) * self.model_energy_unit,
+            "step": self.best_ts_iteration,
+            "energy_unit": self.model.energy_unit,
+            "description": "Best TS guess"
+        }
+        
+        if self.best_ts_forces is not None:
+            max_force = jnp.max(jnp.abs(self.best_ts_forces))
+            rms_force = jnp.sqrt(jnp.mean(self.best_ts_forces**2))
+            properties["max_force"] = float(max_force) * self.model_energy_unit
+            properties["rms_force"] = float(rms_force) * self.model_energy_unit
+        
+        coords_reshaped = self.best_ts_coords.reshape(-1, 3)
+        
+        # Save as XYZ
+        with open(f"{self.output_prefix}.best_ts_guess.xyz", "w") as f:
+            write_xyz_frame(
+                f,
+                self.system_data["symbols"],
+                coords_reshaped,
+                properties=properties
+            )
+        
+        # Save as PDB
+        with open(f"{self.output_prefix}.best_ts_guess.pdb", "w") as f:
+            f.write("REMARK Best Transition State Guess\n")
+            f.write(f"REMARK Method: {self.ts_method}\n")
+            f.write(f"REMARK System: {self.system_data['name']}\n")
+            
+            write_pdb_frame(
+                f,
+                self.system_data["symbols"],
+                coords_reshaped,
+                properties=properties,
+                frame_id=self.best_ts_iteration
+            )
+        
+        print(f"# Best TS guess saved from iteration {self.best_ts_iteration}")
+        print(f"# Best TS energy: {self.best_ts_energy:.8f}")
+        if self.best_ts_forces is not None:
+            print(f"# Best TS max force: {jnp.max(jnp.abs(self.best_ts_forces)):.8f}")
+            print(f"# Best TS RMS force: {jnp.sqrt(jnp.mean(self.best_ts_forces**2)):.8f}")
 
 
 class QuasiNewtonTS(TransitionStateOptimizer):
@@ -121,10 +264,14 @@ class QuasiNewtonTS(TransitionStateOptimizer):
         """Initialize the Hessian matrix"""
         n = len(coords)
         
-        # Start with a scaled identity matrix
-        # Negative diagonal for initial uphill direction
-        initial_scale = self.params.get("ts_initial_hessian_scale", -0.1)
+        # Start with a positive definite Hessian, then modify one eigenvalue
+        # This ensures we start with only one negative eigenvalue
+        initial_scale = self.params.get("ts_initial_hessian_scale", 0.05)
         self.hessian = jnp.eye(n) * initial_scale
+        
+        # Make the first eigenvalue slightly negative to encourage uphill search
+        # This creates only one negative eigenvalue initially
+        self.hessian = self.hessian.at[0, 0].set(-initial_scale * 0.5)
         
     def _update_hessian(self, coords, gradient):
         """Update the Hessian using BFGS or SR1 update scheme"""
@@ -234,7 +381,7 @@ class QuasiNewtonTS(TransitionStateOptimizer):
         # Print initial state
         energy_val = self._safe_get_energy_value(energy)
         self.print_step(0, energy_val, forces, n_negative_eigenvalues=0)
-        self.save_trajectory(coords, 0, energy_val, forces)
+        self.save_enhanced_trajectory(coords, 0, energy_val, forces)
         
         # Main optimization loop
         n_uphill_steps = 0
@@ -249,6 +396,13 @@ class QuasiNewtonTS(TransitionStateOptimizer):
             # Compute eigenvalues and eigenvectors
             eigenvalues, eigenvectors = jnp.linalg.eigh(self.hessian)
             n_negative = jnp.sum(eigenvalues < -self.eigenvalue_tolerance)
+            
+            # Check for too many negative eigenvalues and reset if necessary
+            if n_negative > 2 * self.target_n_negative:
+                print(f"# Warning: Too many negative eigenvalues ({n_negative}), resetting Hessian")
+                self._initialize_hessian(coords)
+                eigenvalues, eigenvectors = jnp.linalg.eigh(self.hessian)
+                n_negative = jnp.sum(eigenvalues < -self.eigenvalue_tolerance)
             
             # Check convergence
             max_force = jnp.max(jnp.abs(forces))
@@ -277,13 +431,20 @@ class QuasiNewtonTS(TransitionStateOptimizer):
             new_energy_val = self._safe_get_energy_value(new_energy)
             energy_val = self._safe_get_energy_value(energy)
             
-            # For TS search, we may accept uphill steps
+            # For TS search, we may accept uphill steps but with stricter criteria
             accept_step = True
-            if new_energy_val > energy_val:
+            energy_diff = new_energy_val - energy_val
+            
+            if energy_diff > 0:  # Uphill step
                 n_uphill_steps += 1
-                if n_uphill_steps > self.max_uphill_steps:
+                # Check if energy increase is too large
+                if energy_diff > 0.1:  # 0.1 Ha energy increase limit
+                    accept_step = False
+                    self.trust_radius = max(self.trust_radius * 0.5, 0.01)  # Minimum trust radius
+                    n_uphill_steps = 0
+                elif n_uphill_steps > self.max_uphill_steps:
                     # Reduce trust radius
-                    self.trust_radius *= 0.5
+                    self.trust_radius = max(self.trust_radius * 0.5, 0.01)  # Minimum trust radius
                     accept_step = False
                     n_uphill_steps = 0
             else:
@@ -311,11 +472,14 @@ class QuasiNewtonTS(TransitionStateOptimizer):
             self.print_step(iteration, energy_val, forces, n_negative, step_time)
             
             if iteration % self.print_freq == 0:
-                self.save_trajectory(coords, iteration, energy_val, forces)
+                self.save_enhanced_trajectory(coords, iteration, energy_val, forces)
                 
         # Save final structure
         energy_val = self._safe_get_energy_value(energy)
-        self.save_trajectory(coords, iteration, energy_val, forces)
+        self.save_enhanced_trajectory(coords, iteration, energy_val, forces)
+        
+        # Save best TS guess
+        self.save_best_ts_guess()
         
         # Final statistics
         total_time = time.time() - t_start
@@ -481,7 +645,7 @@ class DimerMethod(TransitionStateOptimizer):
         # Print initial state
         energy_val = self._safe_get_energy_value(energy)
         self.print_step(0, energy_val, forces)
-        self.save_trajectory(coords, 0, energy_val, forces)
+        self.save_enhanced_trajectory(coords, 0, energy_val, forces)
         
         # Main optimization loop
         converged = False
@@ -564,11 +728,14 @@ class DimerMethod(TransitionStateOptimizer):
             self.print_step(iteration, energy_val, forces, n_negative, step_time)
             
             if iteration % self.print_freq == 0:
-                self.save_trajectory(coords, iteration, energy_val, forces)
+                self.save_enhanced_trajectory(coords, iteration, energy_val, forces)
                 
         # Save final structure
         energy_val = self._safe_get_energy_value(energy)
-        self.save_trajectory(coords, iteration, energy_val, forces)
+        self.save_enhanced_trajectory(coords, iteration, energy_val, forces)
+        
+        # Save best TS guess
+        self.save_best_ts_guess()
         
         # Final statistics
         total_time = time.time() - t_start
@@ -770,7 +937,7 @@ class SN2TransitionState(TransitionStateOptimizer):
         # Print initial state
         energy_val = self._safe_get_energy_value(energy)
         self.print_step(0, energy_val, forces)
-        self.save_trajectory(coords, 0, energy_val, forces)
+        self.save_enhanced_trajectory(coords, 0, energy_val, forces)
         
         # Variables for adaptive step size
         step_size = self.params.get("sn2_initial_step", 0.05)
@@ -869,11 +1036,14 @@ class SN2TransitionState(TransitionStateOptimizer):
                 print(f"#     RC: {rc_value:.4f}, Nu-C: {nu_c_dist:.3f}, C-LG: {c_lg_dist:.3f}")
                 
             if iteration % self.print_freq == 0:
-                self.save_trajectory(coords, iteration, energy_val, forces)
+                self.save_enhanced_trajectory(coords, iteration, energy_val, forces)
                 
         # Save final structure
         energy_val = self._safe_get_energy_value(energy)
-        self.save_trajectory(coords, iteration, energy_val, forces)
+        self.save_enhanced_trajectory(coords, iteration, energy_val, forces)
+        
+        # Save best TS guess
+        self.save_best_ts_guess()
         
         # Final statistics
         total_time = time.time() - t_start

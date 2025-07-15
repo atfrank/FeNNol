@@ -174,6 +174,67 @@ def write_xyz_frame(f, symbols, coordinates,cell=None, **kwargs):
     f.flush()
 
 
+def write_multimodel_xyz_frame(f, symbols, coordinates, properties=None, frame_id=None):
+    """Write a single frame to a multi-model XYZ file
+    
+    Args:
+        f: File handle
+        symbols: List of atomic symbols
+        coordinates: Array of atomic coordinates
+        properties: Dictionary of properties to include in comment
+        frame_id: Optional frame identifier
+    """
+    nat = len(symbols)
+    f.write(f"{nat}\n")
+    
+    # Build comment line
+    comment_line = ""
+    if frame_id is not None:
+        comment_line += f"Frame {frame_id} "
+    
+    if properties:
+        for key, value in properties.items():
+            comment_line += f"{key}={value} "
+    
+    f.write(f"{comment_line.strip()}\n")
+    
+    for i in range(nat):
+        f.write(
+            f"{symbols[i]:3} {coordinates[i,0]: 15.5e} {coordinates[i,1]: 15.5e} {coordinates[i,2]: 15.5e}\n"
+        )
+    f.flush()
+
+
+def write_pdb_frame(f, symbols, coordinates, properties=None, frame_id=None):
+    """Write a single frame to a PDB file
+    
+    Args:
+        f: File handle
+        symbols: List of atomic symbols
+        coordinates: Array of atomic coordinates
+        properties: Dictionary of properties to include in header
+        frame_id: Optional frame identifier
+    """
+    if frame_id is not None:
+        f.write(f"MODEL     {frame_id:4d}\n")
+    
+    # Write header information
+    if properties:
+        for key, value in properties.items():
+            f.write(f"REMARK {key}: {value}\n")
+    
+    # Write atom records
+    for i, (symbol, coord) in enumerate(zip(symbols, coordinates)):
+        f.write(f"ATOM  {i+1:5d}  {symbol:3s} UNK A{1:4d}    "
+                f"{coord[0]:8.3f}{coord[1]:8.3f}{coord[2]:8.3f}"
+                f"{1.00:6.2f}{0.00:6.2f}           {symbol:>2s}\n")
+    
+    if frame_id is not None:
+        f.write("ENDMDL\n")
+    
+    f.flush()
+
+
 def human_time_duration(seconds: float):
     """Convert seconds (duration) to human readable string
 

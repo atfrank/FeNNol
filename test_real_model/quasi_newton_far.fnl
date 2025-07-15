@@ -1,21 +1,15 @@
-# Quasi-Newton transition state test with MACE model
-
-# Device and precision settings
+# Quasi-Newton TS test with far initial guess
 device = cpu
 enable_x64 = True
 matmul_prec = highest
-
-# Model file
 model_file = /home/aaron/ATX/projects/fennol-test/mace_mp_large.fnx
 
-# System input
 xyz_input {
-    file = water_dimer.xyz
+    file = water_dimer_far.xyz
     indexed = no
     has_comment_line = yes
 }
 
-# Transition state settings
 transition_state = True
 ts_only = True
 ts_method = quasi_newton
@@ -25,12 +19,10 @@ ts_eigenvalue_tolerance = 1e-4
 ts_max_uphill_steps = 2
 ts_initial_hessian_scale = 0.05
 
-# Minimization parameters
-min_max_iterations = 20
+min_max_iterations = 30
 min_force_tolerance = 1e-3
 min_print_freq = 1
-min_max_step = 0.1
+min_max_step = 0.3
 
-# Output settings
-output_prefix = quasi_newton_test
+output_prefix = quasi_newton_far
 traj_format = xyz

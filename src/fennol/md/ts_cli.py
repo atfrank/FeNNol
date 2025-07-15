@@ -42,6 +42,10 @@ def main():
                        help="Device to run on (overrides input file)")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="Enable verbose output")
+    parser.add_argument("--no-multimodel", action="store_true",
+                       help="Disable multi-model XYZ trajectory writing")
+    parser.add_argument("--no-pdb", action="store_true",
+                       help="Disable PDB trajectory writing")
     
     args = parser.parse_args()
     
@@ -61,6 +65,10 @@ def main():
         simulation_parameters["min_force_tolerance"] = args.force_tolerance
     if args.device:
         simulation_parameters["device"] = args.device
+    if args.no_multimodel:
+        simulation_parameters["write_multimodel_trajectory"] = False
+    if args.no_pdb:
+        simulation_parameters["write_pdb_trajectory"] = False
         
     # Ensure TS mode is enabled
     simulation_parameters["transition_state"] = True
@@ -196,6 +204,24 @@ def run_ts_optimization(simulation_parameters, fprec, verbose=False):
         )
     
     print(f"# Final TS structure saved to: {output_name}.ts.xyz")
+    
+    # List additional output files
+    additional_files = []
+    if simulation_parameters.get("write_multimodel_trajectory", True):
+        additional_files.append(f"{output_name}.multimodel.xyz")
+    if simulation_parameters.get("write_pdb_trajectory", True):
+        additional_files.append(f"{output_name}.traj.pdb")
+    
+    # Check for best TS guess files
+    best_ts_files = [f"{output_name}.best_ts_guess.xyz", f"{output_name}.best_ts_guess.pdb"]
+    for file in best_ts_files:
+        if os.path.exists(file):
+            additional_files.append(file)
+    
+    if additional_files:
+        print("# Additional output files:")
+        for file in additional_files:
+            print(f"#   {file}")
     
     if not ts_result.get('converged', False):
         print("# Warning: Optimization did not converge!")
