@@ -485,7 +485,7 @@ class DimerMethod(TransitionStateOptimizer):
         
         # Main optimization loop
         converged = False
-        step_size = self.initial_step_size
+        step_size = self.params.get("min_initial_step", 0.01)
         
         for iteration in range(1, self.max_iterations + 1):
             iter_start = time.time()
@@ -686,6 +686,10 @@ class SN2TransitionState(TransitionStateOptimizer):
         # Constraint forces to maintain reasonable geometry
         constraint_forces = jnp.zeros_like(forces)
         
+        # Ensure constraint_forces has the same shape as forces
+        if constraint_forces.ndim != forces.ndim:
+            constraint_forces = constraint_forces.reshape(forces.shape)
+        
         # Constraint 1: Keep Nu-C distance reasonable
         if nu_c_dist > self.sn2_target_nu_c_distance:
             excess = nu_c_dist - self.sn2_target_nu_c_distance
@@ -696,10 +700,8 @@ class SN2TransitionState(TransitionStateOptimizer):
             nu_c_unit = nu_c_vec / jnp.linalg.norm(nu_c_vec)
             
             # Pull nucleophile toward carbon
-            constraint_forces_3d = constraint_forces.reshape(-1, 3)
-            constraint_forces_3d = constraint_forces_3d.at[self.nu_index].add(-constraint_strength * nu_c_unit)
-            constraint_forces_3d = constraint_forces_3d.at[self.c_index].add(constraint_strength * nu_c_unit)
-            constraint_forces = constraint_forces_3d.reshape(-1)
+            constraint_forces = constraint_forces.at[self.nu_index].add(-constraint_strength * nu_c_unit)
+            constraint_forces = constraint_forces.at[self.c_index].add(constraint_strength * nu_c_unit)
         
         # Constraint 2: Keep C-LG distance reasonable
         if c_lg_dist > self.sn2_target_c_lg_distance:
@@ -711,10 +713,8 @@ class SN2TransitionState(TransitionStateOptimizer):
             c_lg_unit = c_lg_vec / jnp.linalg.norm(c_lg_vec)
             
             # Pull carbon toward leaving group
-            constraint_forces_3d = constraint_forces.reshape(-1, 3)
-            constraint_forces_3d = constraint_forces_3d.at[self.c_index].add(-constraint_strength * c_lg_unit)
-            constraint_forces_3d = constraint_forces_3d.at[self.lg_index].add(constraint_strength * c_lg_unit)
-            constraint_forces = constraint_forces_3d.reshape(-1)
+            constraint_forces = constraint_forces.at[self.c_index].add(-constraint_strength * c_lg_unit)
+            constraint_forces = constraint_forces.at[self.lg_index].add(constraint_strength * c_lg_unit)
         
         return forces + constraint_forces, rc_value, nu_c_dist, c_lg_dist
         
