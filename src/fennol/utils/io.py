@@ -161,12 +161,21 @@ def write_extxyz_frame(
     f.flush()
 
 
-def write_xyz_frame(f, symbols, coordinates,cell=None, **kwargs):
+def write_xyz_frame(f, symbols, coordinates, cell=None, properties=None, **kwargs):
     nat = len(symbols)
     f.write(f"{nat}\n")
+    
+    # Build comment line
+    comment_line = ""
     if cell is not None:
-        f.write(" ".join([f"{x:.3f}" for x in cell.flatten()]))
-    f.write("\n")
+        comment_line += " ".join([f"{x:.3f}" for x in cell.flatten()]) + " "
+    
+    if properties:
+        for key, value in properties.items():
+            comment_line += f"{key}={value} "
+    
+    f.write(f"{comment_line.strip()}\n")
+    
     for i in range(nat):
         f.write(
             f"{symbols[i]:3} {coordinates[i,0]: 15.5e} {coordinates[i,1]: 15.5e} {coordinates[i,2]: 15.5e}\n"
