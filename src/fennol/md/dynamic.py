@@ -327,21 +327,39 @@ def dynamic(simulation_parameters, device, fprec):
         )
 
     write_all_beads = simulation_parameters.get("write_all_beads", False) and pimd
-
+    
+    # Allow custom trajectory output path/prefix
+    trajectory_output = simulation_parameters.get("trajectory_file")
+    output_prefix = simulation_parameters.get("output_prefix")
+    
+    # Debug print to see what we're getting
+    if trajectory_output or output_prefix:
+        print(f"# Custom trajectory output: trajectory_file={trajectory_output}, output_prefix={output_prefix}")
+    
+    if trajectory_output is not None:
+        # If trajectory_file is specified, use it as-is (user provides full path)
+        trajectory_base = str(trajectory_output).rsplit('.', 1)[0]  # Remove extension if provided
+    elif output_prefix is not None:
+        # Use output_prefix if specified
+        trajectory_base = str(output_prefix)
+    else:
+        # Default to system name
+        trajectory_base = system_name
+    
     if write_all_beads:
         fout = [
-            open(f"{system_name}_bead{i+1:03d}" + traj_ext, "a") for i in range(nbeads)
+            open(f"{trajectory_base}_bead{i+1:03d}" + traj_ext, "a") for i in range(nbeads)
         ]
     else:
-        fout = open(system_name + traj_ext, "a")
+        fout = open(trajectory_base + traj_ext, "a")
 
     ensemble_key = simulation_parameters.get("etot_ensemble_key", None)
     if ensemble_key is not None:
-        fens = open(f"{system_name}.ensemble_weights.traj", "a")
+        fens = open(f"{trajectory_base}.ensemble_weights.traj", "a")
 
     write_centroid = simulation_parameters.get("write_centroid", False) and pimd
     if write_centroid:
-        fcentroid = open(f"{system_name}_centroid" + traj_ext, "a")
+        fcentroid = open(f"{trajectory_base}_centroid" + traj_ext, "a")
 
     fcolvars = None
 

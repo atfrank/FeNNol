@@ -48,9 +48,9 @@ restraints {
       type = multi_site_backside              # or "backside_attack_multi"
 
       # Required: List of nucleophile atom indices (0-based)
-      nucleophiles = 207, 175         # Your nucleophilic sites (e.g., 2'-OH, N7, N3)
+      nucleophiles = 201, 173         # Your nucleophilic sites (e.g., 2'-OH, N7, N3)
       carbon = 229                              # Index of electrophilic carbon on warhead
-      leaving_group = 230                      # Index of leaving group (optional - will auto-detect)
+      leaving_group = 239                      # Index of leaving group (optional - will auto-detect)
 
       # Target geometry
       target = 200.0                          # Target angle in degrees for backside attack
@@ -91,7 +91,7 @@ restraints {
 
       # List of atom pairs to keep at current distances (flat list: atom1, atom2, atom3, atom4, ...)
       # This prevents unwanted nucleophiles from approaching
-      atom_pairs = 229, 228, 229, 230, 228, 227, 227, 226, 226, 224, 227, 260, 227, 261, 228, 329, 229, 330, 229, 331
+      atom_pairs = 229, 228, 229, 239, 228, 227, 227, 226, 226, 224, 227, 260, 227, 261, 228, 329, 229, 330, 229, 331
 
       force_constant = 1.0  # Adjust strength as needed
       style = flat_bottom     # Only apply force when getting too close
