@@ -1673,6 +1673,304 @@ def _backside_attack_restraint_force_flexible(coordinates: jnp.ndarray, nucleoph
     
     return total_energy, total_forces
 
+
+def multi_site_backside_restraint_force(coordinates: jnp.ndarray, 
+                                       nucleophiles: List[int],
+                                       carbon: int,
+                                       leaving_group: Optional[int],
+                                       target_angle: float,
+                                       base_angle_force_constant: float,
+                                       target_distance: Optional[float] = None,
+                                       base_distance_force_constant: Optional[float] = None,
+                                       weighting_mode: str = "distance",
+                                       distance_alpha: float = 0.5,
+                                       standby_multiplier: float = 0.3,
+                                       write_selectivity: bool = False,
+                                       selectivity_file: Optional[str] = None,
+                                       current_step: Optional[int] = None) -> Tuple[float, jnp.ndarray]:
+    """
+    Calculate force and energy for multi-site backside attack restraint.
+    
+    This implements a soft competition model where all nucleophilic sites receive
+    restraint forces, weighted by their proximity and geometry quality.
+    
+    Args:
+        coordinates: Atomic coordinates [n_atoms, 3]
+        nucleophiles: List of potential nucleophile atom indices
+        carbon: Index of the carbon being attacked
+        leaving_group: Index of the leaving group (auto-detected if None)
+        target_angle: Target angle in radians (typically π for 180°)
+        base_angle_force_constant: Base force constant for angle restraint
+        target_distance: Optional target Nu-C distance (in Angstroms)
+        base_distance_force_constant: Optional base force constant for distance
+        weighting_mode: "distance", "geometry", or "hybrid" for weight calculation
+        distance_alpha: Exponential decay factor for distance weighting
+        standby_multiplier: Force multiplier for non-primary sites (0-1)
+        write_selectivity: Whether to track selectivity metrics
+        selectivity_file: File to write selectivity data to
+        current_step: Current simulation step
+        
+    Returns:
+        Tuple of (total_energy, total_forces)
+    """
+    global current_simulation_step, restraint_debug_enabled
+    
+    coordinates = ensure_proper_coordinates(coordinates)
+    
+    # Auto-detect leaving group if not provided
+    if leaving_group is None:
+        leaving_group = find_leaving_group(coordinates, carbon, nucleophiles[0])
+    
+    # Initialize outputs
+    total_energy = 0.0
+    total_forces = jnp.zeros_like(coordinates)
+    
+    # Calculate metrics for all sites
+    site_metrics = []
+    for nu_idx in nucleophiles:
+        # Calculate distances
+        nu_c_dist = colvar_distance(coordinates, nu_idx, carbon)
+        c_lg_dist = colvar_distance(coordinates, carbon, leaving_group)
+        nu_lg_dist = colvar_distance(coordinates, nu_idx, leaving_group)
+        
+        # Calculate angle (Nu-C-LG)
+        angle = colvar_angle(coordinates, nu_idx, carbon, leaving_group)
+        
+        # Calculate reaction coordinate
+        rc = nu_c_dist - c_lg_dist
+        
+        # Calculate geometry quality score (how SN2-like is this configuration)
+        angle_quality = jnp.cos(angle - target_angle)**2  # 1.0 for perfect 180°
+        
+        site_metrics.append({
+            'index': nu_idx,
+            'nu_c_dist': nu_c_dist,
+            'c_lg_dist': c_lg_dist,
+            'nu_lg_dist': nu_lg_dist,
+            'angle': angle,
+            'angle_deg': angle * 180.0 / jnp.pi,
+            'rc': rc,
+            'angle_quality': angle_quality
+        })
+    
+    # Calculate weights based on selected mode
+    weights = _calculate_site_weights(site_metrics, weighting_mode, distance_alpha, target_distance)
+    
+    # Find primary site (highest weight)
+    primary_idx = jnp.argmax(jnp.array([w for w in weights]))
+    
+    # Apply restraints to each site with appropriate weighting
+    for i, (metrics, weight) in enumerate(zip(site_metrics, weights)):
+        nu_idx = metrics['index']
+        
+        # Determine effective force constants
+        if i == primary_idx:
+            # Primary site gets full force
+            angle_fc = base_angle_force_constant * weight
+            dist_fc = base_distance_force_constant * weight if base_distance_force_constant else None
+        else:
+            # Secondary sites get standby force
+            angle_fc = base_angle_force_constant * weight * standby_multiplier
+            dist_fc = base_distance_force_constant * weight * standby_multiplier if base_distance_force_constant else None
+        
+        # Apply backside restraint for this site
+        site_energy, site_forces = backside_attack_restraint_force(
+            coordinates, nu_idx, carbon, leaving_group,
+            target_angle, angle_fc, target_distance, dist_fc,
+            restraint_function=harmonic_restraint,
+            prevent_inversion=True,
+            inversion_penalty_factor=2.0
+        )
+        
+        # Add contribution
+        total_energy += site_energy
+        total_forces += site_forces
+        
+        # Store effective force constant in metrics
+        metrics['effective_angle_fc'] = angle_fc
+        metrics['effective_dist_fc'] = dist_fc
+        metrics['weight'] = weight
+        metrics['is_primary'] = (i == primary_idx)
+        metrics['energy_contribution'] = site_energy
+    
+    # Prepare selectivity metrics for return
+    selectivity_data = {
+        'step': current_simulation_step if current_simulation_step is not None else current_step,
+        'sites': site_metrics,
+        'primary_site': nucleophiles[primary_idx],
+        'weights': weights,
+        'total_energy': total_energy
+    }
+    
+    # Write selectivity data if requested
+    if write_selectivity and selectivity_file and current_simulation_step is not None:
+        _write_selectivity_data(selectivity_file, selectivity_data, current_simulation_step)
+    
+    # Debug output
+    if restraint_debug_enabled and (current_simulation_step % 100 == 0 or current_simulation_step <= 5):
+        print(f"# MULTI-SITE RESTRAINT DEBUG [step={current_simulation_step}]:")
+        print(f"#   Primary site: {nucleophiles[primary_idx]} (weight={weights[primary_idx]:.3f})")
+        for i, m in enumerate(site_metrics):
+            print(f"#   Site {m['index']}: RC={m['rc']:.3f}, angle={m['angle_deg']:.1f}°, "
+                  f"dist={m['nu_c_dist']:.3f}Å, weight={m['weight']:.3f}")
+    
+    return total_energy, total_forces
+
+
+def _calculate_site_weights(site_metrics: List[Dict], mode: str, alpha: float, 
+                           target_distance: Optional[float] = None) -> List[float]:
+    """Calculate normalized weights for each nucleophilic site."""
+    
+    if mode == "distance":
+        # Weight by inverse distance (closer = higher weight)
+        distances = jnp.array([m['nu_c_dist'] for m in site_metrics])
+        raw_weights = jnp.exp(-alpha * distances)
+        
+    elif mode == "geometry":
+        # Weight by geometry quality (better angle = higher weight)
+        qualities = jnp.array([m['angle_quality'] for m in site_metrics])
+        distances = jnp.array([m['nu_c_dist'] for m in site_metrics])
+        
+        # Combine angle quality with distance penalty
+        if target_distance:
+            dist_penalties = jnp.exp(-0.5 * ((distances - target_distance) / 1.0)**2)
+            raw_weights = qualities * dist_penalties
+        else:
+            # Just use angle quality with mild distance preference
+            raw_weights = qualities * jnp.exp(-0.2 * distances)
+            
+    elif mode == "hybrid":
+        # Combine distance and geometry factors
+        distances = jnp.array([m['nu_c_dist'] for m in site_metrics])
+        qualities = jnp.array([m['angle_quality'] for m in site_metrics])
+        
+        # Distance component (exponential decay)
+        dist_weights = jnp.exp(-alpha * distances)
+        
+        # Geometry component (angle quality)
+        geom_weights = qualities
+        
+        # Combine with equal weighting
+        raw_weights = 0.5 * dist_weights + 0.5 * geom_weights
+        
+    else:
+        raise ValueError(f"Unknown weighting mode: {mode}")
+    
+    # Normalize weights to sum to 1
+    total_weight = jnp.sum(raw_weights)
+    if total_weight > 0:
+        weights = raw_weights / total_weight
+    else:
+        # Fallback to equal weights if all are zero
+        weights = jnp.ones(len(site_metrics)) / len(site_metrics)
+    
+    return weights.tolist()
+
+
+def _write_selectivity_data(filename: str, data: Dict, step: int):
+    """Write selectivity tracking data to file."""
+    import os
+    
+    # Create header if file doesn't exist
+    write_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
+    
+    with open(filename, 'a') as f:
+        if write_header:
+            # Write header
+            n_sites = len(data['sites'])
+            header = "# step  primary"
+            
+            # Add columns for each site
+            for i, metrics in enumerate(data['sites']):
+                site_id = metrics['index']
+                header += f"  RC_{site_id}  angle_{site_id}  dist_{site_id}  weight_{site_id}"
+            
+            header += "  total_E\n"
+            f.write(header)
+        
+        # Write data row
+        row = f"{step:8d}  {data['primary_site']:4d}"
+        
+        for metrics in data['sites']:
+            row += f"  {metrics['rc']:7.4f}  {metrics['angle_deg']:6.1f}  "
+            row += f"{metrics['nu_c_dist']:7.4f}  {metrics['weight']:6.4f}"
+        
+        row += f"  {data['total_energy']:10.6f}\n"
+        f.write(row)
+
+
+def preserve_distances_restraint_force(coordinates: jnp.ndarray,
+                                      atom_pairs: List[List[int]],
+                                      target_distances: List[float],
+                                      force_constant: float,
+                                      tolerance: float = 0.0,
+                                      style: str = "harmonic") -> Tuple[float, jnp.ndarray]:
+    """
+    Preserve multiple distances at their initial or specified values.
+    
+    This restraint maintains distances between multiple atom pairs, automatically
+    using initial distances if not explicitly provided. Useful for preventing
+    unwanted reactions by keeping reactive groups separated.
+    
+    Args:
+        coordinates: Atomic coordinates [n_atoms, 3]
+        atom_pairs: List of [atom1, atom2] pairs to restrain
+        target_distances: List of target distances (same length as atom_pairs)
+        force_constant: Force constant to apply to all pairs
+        tolerance: Tolerance for flat-bottom potential (0 for harmonic)
+        style: "harmonic" or "flat_bottom"
+        
+    Returns:
+        Tuple of (total_energy, total_forces)
+    """
+    global restraint_debug_enabled, current_simulation_step
+    
+    coordinates = ensure_proper_coordinates(coordinates)
+    total_energy = 0.0
+    total_forces = jnp.zeros_like(coordinates)
+    
+    # Select restraint function
+    if style == "flat_bottom" and tolerance > 0:
+        restraint_func = partial(flat_bottom_restraint, tolerance=tolerance)
+    else:
+        restraint_func = harmonic_restraint
+    
+    # Apply restraints to each pair
+    for i, (pair, target_dist) in enumerate(zip(atom_pairs, target_distances)):
+        atom1, atom2 = pair
+        
+        # Calculate current distance
+        current_dist = colvar_distance(coordinates, atom1, atom2)
+        
+        # Apply restraint
+        energy, force_mag = restraint_func(current_dist, target_dist, force_constant)
+        
+        # Calculate force direction
+        vec = coordinates[atom1] - coordinates[atom2]
+        dist = jnp.linalg.norm(vec)
+        if dist > 1e-10:
+            unit_vec = vec / dist
+            force1 = -force_mag * unit_vec
+            force2 = -force1
+            
+            total_forces = total_forces.at[atom1].add(force1)
+            total_forces = total_forces.at[atom2].add(force2)
+        
+        total_energy += energy
+        
+        # Debug output for first few pairs
+        if restraint_debug_enabled and i < 3 and (current_simulation_step % 100 == 0 or current_simulation_step <= 5):
+            deviation = current_dist - target_dist
+            print(f"# PRESERVE_DIST [{atom1}-{atom2}]: current={current_dist:.3f}Å, "
+                  f"target={target_dist:.3f}Å, deviation={deviation:+.3f}Å, E={energy:.6f}")
+    
+    # Summary debug output
+    if restraint_debug_enabled and (current_simulation_step % 100 == 0 or current_simulation_step <= 5):
+        print(f"# PRESERVE_DISTANCES: {len(atom_pairs)} pairs, total_E={total_energy:.6f}")
+    
+    return total_energy, total_forces
+
+
 def time_varying_force_constant(force_constants: List[float], update_steps: int, current_step: int,
                              debug: bool = False, name: str = "", mode: str = "interpolate") -> float:
     """
@@ -2050,6 +2348,83 @@ def setup_restraints(restraint_definitions: Dict[str, Any], nsteps: Optional[int
             restraint_metadata["restraints"][restraint_name] = {
                 "type": "adaptive_sn2",
                 "simulation_steps": simulation_steps
+            }
+            
+        elif restraint_type == "backside_attack_multi" or restraint_type == "multi_site_backside":
+            # Multi-site backside attack restraint
+            nucleophiles_raw = restraint_def["nucleophiles"]
+            if not isinstance(nucleophiles_raw, list):
+                raise ValueError(f"nucleophiles must be a list for multi-site backside attack")
+            nucleophiles = [int(n) for n in nucleophiles_raw]
+            
+            carbon = int(restraint_def["carbon"])
+            leaving_group = restraint_def.get("leaving_group")  # Optional
+            if leaving_group is not None:
+                leaving_group = int(leaving_group)
+            
+            # Target angle (convert degrees to radians if needed)
+            target_angle_raw = restraint_def.get("target", 180.0)
+            if isinstance(target_angle_raw, (int, float)) and abs(target_angle_raw) > 2 * jnp.pi:
+                target_angle = float(target_angle_raw) * jnp.pi / 180.0
+            else:
+                target_angle = float(target_angle_raw)
+            
+            # Force constants
+            base_angle_fc = float(restraint_def.get("base_angle_force_constant", 
+                                                   restraint_def.get("angle_force_constant", 10.0)))
+            
+            # Optional distance parameters
+            target_distance = restraint_def.get("target_distance")
+            if target_distance is not None:
+                target_distance = float(target_distance)
+            
+            base_distance_fc = restraint_def.get("base_distance_force_constant",
+                                                restraint_def.get("distance_force_constant"))
+            if base_distance_fc is not None:
+                base_distance_fc = float(base_distance_fc)
+            
+            # Weighting parameters
+            weighting_mode = restraint_def.get("weighting_mode", "distance")
+            distance_alpha = float(restraint_def.get("distance_alpha", 0.5))
+            standby_multiplier = float(restraint_def.get("standby_multiplier", 0.3))
+            
+            # Selectivity tracking
+            write_selectivity = restraint_def.get("write_selectivity", False)
+            selectivity_file = restraint_def.get("selectivity_output", f"selectivity_{restraint_name}.dat")
+            
+            # Create force calculator
+            force_calc = partial(
+                multi_site_backside_restraint_force,
+                nucleophiles=nucleophiles,
+                carbon=carbon,
+                leaving_group=leaving_group,
+                target_angle=target_angle,
+                base_angle_force_constant=base_angle_fc,
+                target_distance=target_distance,
+                base_distance_force_constant=base_distance_fc,
+                weighting_mode=weighting_mode,
+                distance_alpha=distance_alpha,
+                standby_multiplier=standby_multiplier,
+                write_selectivity=write_selectivity,
+                selectivity_file=selectivity_file
+            )
+            
+            # Create energy calculator
+            def energy_calc(coordinates, nuc=nucleophiles, c=carbon, lg=leaving_group,
+                           t_angle=target_angle, base_afc=base_angle_fc, t_dist=target_distance,
+                           base_dfc=base_distance_fc, w_mode=weighting_mode, d_alpha=distance_alpha,
+                           s_mult=standby_multiplier):
+                energy, _ = multi_site_backside_restraint_force(
+                    coordinates, nuc, c, lg, t_angle, base_afc, t_dist, base_dfc,
+                    w_mode, d_alpha, s_mult, False, None
+                )
+                return energy
+            
+            restraint_metadata["restraints"][restraint_name] = {
+                "type": "multi_site_backside",
+                "nucleophiles": nucleophiles,
+                "write_selectivity": write_selectivity,
+                "selectivity_file": selectivity_file
             }
             
         elif restraint_type == "backside_attack":
@@ -2510,6 +2885,83 @@ def setup_restraints(restraint_definitions: Dict[str, Any], nsteps: Optional[int
                     prevent_inversion=prevent_inversion,
                     inversion_penalty_factor=inversion_penalty_factor
                 )
+            
+        elif restraint_type == "preserve_distances":
+            # Preserve multiple distances at their initial values
+            atom_pairs_raw = restraint_def.get("atom_pairs")
+            if not atom_pairs_raw:
+                raise ValueError(f"atom_pairs required for preserve_distances restraint '{restraint_name}'")
+            
+            # Parse atom pairs - expect a flat list [atom1, atom2, atom3, atom4, ...]
+            if len(atom_pairs_raw) % 2 != 0:
+                raise ValueError(f"atom_pairs must have even number of elements in preserve_distances restraint '{restraint_name}'")
+            
+            atom_pairs = []
+            for i in range(0, len(atom_pairs_raw), 2):
+                atom1 = int(atom_pairs_raw[i])
+                atom2 = int(atom_pairs_raw[i+1])
+                atom_pairs.append([atom1, atom2])
+            
+            # Get force constant
+            force_constant = float(restraint_def.get("force_constant", 10.0))
+            
+            # Get tolerance for flat-bottom (optional)
+            tolerance = float(restraint_def.get("tolerance", 0.0))
+            
+            # Get style
+            style = restraint_def.get("style", "harmonic")
+            
+            # Calculate initial distances if not provided
+            if initial_coordinates is None:
+                raise ValueError(f"Initial coordinates required for preserve_distances restraint '{restraint_name}'")
+            
+            # Check if targets are provided, otherwise calculate from initial coordinates
+            target_distances_raw = restraint_def.get("target_distances")
+            if target_distances_raw:
+                # Use provided targets
+                if len(target_distances_raw) != len(atom_pairs):
+                    raise ValueError(f"Number of target_distances must match atom_pairs in restraint '{restraint_name}'")
+                target_distances = [float(d) for d in target_distances_raw]
+            else:
+                # Calculate from initial coordinates
+                target_distances = []
+                for atom1, atom2 in atom_pairs:
+                    dist = colvar_distance(jnp.asarray(initial_coordinates), atom1, atom2)
+                    target_distances.append(float(dist))
+                
+                # Print calculated distances
+                print(f"# Restraint '{restraint_name}': Auto-calculated target distances from initial structure:")
+                for i, (pair, dist) in enumerate(zip(atom_pairs, target_distances)):
+                    if i < 5:  # Show first 5
+                        print(f"#   [{pair[0]}-{pair[1]}]: {dist:.3f} Å")
+                if len(atom_pairs) > 5:
+                    print(f"#   ... and {len(atom_pairs)-5} more pairs")
+            
+            # Store metadata
+            restraint_metadata["restraints"][restraint_name] = {
+                "type": "preserve_distances",
+                "atom_pairs": atom_pairs,
+                "target_distances": target_distances,
+                "force_constant": force_constant
+            }
+            
+            # Create force calculator
+            force_calc = partial(
+                preserve_distances_restraint_force,
+                atom_pairs=atom_pairs,
+                target_distances=target_distances,
+                force_constant=force_constant,
+                tolerance=tolerance,
+                style=style
+            )
+            
+            # Create energy calculator
+            def energy_calc(coordinates, pairs=atom_pairs, targets=target_distances, 
+                           fc=force_constant, tol=tolerance, st=style):
+                energy, _ = preserve_distances_restraint_force(
+                    coordinates, pairs, targets, fc, tol, st
+                )
+                return energy
             
         elif restraint_type == "spherical_boundary":
             # Spherical boundary restraint
