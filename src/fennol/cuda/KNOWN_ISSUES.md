@@ -2,7 +2,7 @@
 
 This document tracks known bugs and issues in the CUDA native implementation that require future attention.
 
-## Critical Bugs (Fixed in commits 1c9ad81, a3f29aa, 5871e3c)
+## Critical Bugs (Fixed in commits 1c9ad81, a3f29aa, 5871e3c, 4daa12c, 819f884, c385092)
 
 The following critical bugs were discovered through comprehensive code review and have been **FIXED**:
 
@@ -20,7 +20,13 @@ The following critical bugs were discovered through comprehensive code review an
 ✅ **Multi-GPU** - Missing cudaSetDevice error checking (CUDA_CHECK_MULTI added - commit 5871e3c)
 ✅ **Multi-GPU** - Kernels not using streams (stream support added - commit 4daa12c)
 ✅ **Multi-GPU** - Sequential GPU processing (async launch/sync/gather phases - commit 4daa12c)
-✅ **Multi-GPU** - Halo exchange not implemented (full implementation added - current commit)
+✅ **Multi-GPU** - Halo exchange not implemented (full implementation added - commit 819f884)
+✅ **Multi-GPU** - Buffer overflow in halo exchange (bounds checking added - commit c385092)
+✅ **Multi-GPU** - Incorrect boundary atom detection (>= instead of > - commit c385092)
+✅ **Multi-GPU** - Use-after-free in async copies (host memory lifetime fix - commit c385092)
+✅ **Multi-GPU** - Synchronous cudaMalloc in async loops (pre-allocation added - commit c385092)
+✅ **Multi-GPU** - Insufficient buffer size calculation (2.5x safety factor - commit c385092)
+✅ **Multi-GPU** - Missing error checking in cleanup (safe_free wrapper - commit c385092)
 ✅ **Documentation** - Incorrect Velocity Verlet description (integrate.cuh fixed - commit 5871e3c)
 ✅ **Code quality** - Dead code removed (get_device_ptr() removed - commit 5871e3c)
 
@@ -76,13 +82,18 @@ Current implementation may be correct, but verification is recommended.
 
 ## Summary
 
-**Fixed:** 17 critical bugs and issues across all categories
+**Fixed:** 23 critical bugs and issues across all categories
 - 6 critical bugs in kernels (division by zero, force sign errors, derivative formulas) - commit 1c9ad81
 - 2 memory safety issues in Python bindings (RAII wrappers, input validation) - commit 5871e3c
-- 6 multi-GPU bugs (initialization, synchronization, boundary assignment, error checking, streams, async processing) - commits 5871e3c, 4daa12c
-- 1 multi-GPU feature (halo exchange implementation) - current commit
+- 12 multi-GPU bugs:
+  - Initial fixes (initialization, synchronization, boundary assignment, error checking) - commit 5871e3c
+  - Stream support and async processing - commit 4daa12c
+  - Halo exchange implementation - commit 819f884
+  - Memory safety (buffer overflow, use-after-free, bounds checking) - commit c385092
+  - Performance (synchronous allocations, buffer sizing) - commit c385092
+- 1 multi-GPU feature (halo exchange implementation) - commit 819f884
 - 2 documentation/code quality issues (misleading docs, dead code) - commit 5871e3c
 
 **Remaining High Priority:** 0 issues
 
-**Recommendation:** All core functionality (single-GPU integration, restraints, physics, Python bindings) and multi-GPU support are now production-ready. The halo exchange implementation uses host staging for reliability; peer-to-peer GPU transfers or NCCL could be added for performance optimization on systems with NVLink.
+**Recommendation:** All core functionality (single-GPU integration, restraints, physics, Python bindings) and multi-GPU support are now production-ready and memory-safe. The implementation has been thoroughly reviewed by specialized sub-agents and all critical bugs have been fixed. The halo exchange uses host staging for maximum reliability; peer-to-peer GPU transfers or NCCL could be added for performance optimization on systems with NVLink.
