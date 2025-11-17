@@ -4,6 +4,32 @@
 namespace fennol {
 namespace cuda {
 
+// RAII wrapper for CUDA memory to prevent leaks on exceptions
+template<typename T>
+class CudaMemory {
+    T* ptr = nullptr;
+    size_t count = 0;
+
+public:
+    explicit CudaMemory(size_t n) : count(n) {
+        if (n > 0) {
+            CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(T)));
+        }
+    }
+
+    ~CudaMemory() {
+        if (ptr) {
+            cudaFree(ptr);  // Don't throw from destructor
+        }
+    }
+
+    // Delete copy operations
+    CudaMemory(const CudaMemory&) = delete;
+    CudaMemory& operator=(const CudaMemory&) = delete;
+
+    T* get() { return ptr; }
+};
+
 // Kernel for velocity Verlet step A
 __global__ void velocity_verlet_step_a_kernel(
     double* coordinates,
@@ -83,29 +109,33 @@ __global__ void velocity_verlet_step_b_kernel(
 
     if (idx < natoms) {
         double mass = masses[idx];
-        if (mass < 1e-10) return;  // Skip atoms with invalid mass
-        double dt2m = dt2 / mass;
+        // CRITICAL FIX: Cannot return early - must reach __syncthreads() in blockReduceSum()
+        // Early return causes race condition and potential deadlock
+        if (mass >= 1e-10) {  // Only process valid masses, but don't skip reduction
+            double dt2m = dt2 / mass;
 
-        Vec3 vel;
-        // Update velocities: v = v + (dt/2) * f / m
-        for (int d = 0; d < 3; ++d) {
-            int i = idx * 3 + d;
-            velocities[i] += forces[i] * dt2m;
-            if (d == 0) vel.x = velocities[i];
-            else if (d == 1) vel.y = velocities[i];
-            else vel.z = velocities[i];
-        }
+            Vec3 vel;
+            // Update velocities: v = v + (dt/2) * f / m
+            for (int d = 0; d < 3; ++d) {
+                int i = idx * 3 + d;
+                velocities[i] += forces[i] * dt2m;
+                if (d == 0) vel.x = velocities[i];
+                else if (d == 1) vel.y = velocities[i];
+                else vel.z = velocities[i];
+            }
 
-        // Compute kinetic energy contribution: 0.5 * m * v^2
-        local_energy = 0.5 * mass * vel.norm_squared();
+            // Compute kinetic energy contribution: 0.5 * m * v^2
+            local_energy = 0.5 * mass * vel.norm_squared();
 
-        // Compute kinetic tensor contribution: 0.5 * m * v_i * v_j
-        double v[3] = {vel.x, vel.y, vel.z};
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                local_tensor[i * 3 + j] = 0.5 * mass * v[i] * v[j];
+            // Compute kinetic tensor contribution: 0.5 * m * v_i * v_j
+            double v[3] = {vel.x, vel.y, vel.z};
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    local_tensor[i * 3 + j] = 0.5 * mass * v[i] * v[j];
+                }
             }
         }
+        // If mass < 1e-10, local_energy and local_tensor remain 0.0 (initialized above)
     }
 
     // Block-level reduction for energy
@@ -163,34 +193,30 @@ void velocity_verlet_step_b(
     double dt2 = 0.5 * dt;
     int nblocks = (natoms + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    // Allocate temporary storage for partial reductions
-    double* d_partial_energies;
-    double* d_partial_tensors;
-    CUDA_CHECK(cudaMalloc(&d_partial_energies, nblocks * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_partial_tensors, nblocks * 9 * sizeof(double)));
+    // Allocate temporary storage for partial reductions using RAII
+    // Prevents memory leaks if CUDA_CHECK throws exception
+    CudaMemory<double> d_partial_energies(nblocks);
+    CudaMemory<double> d_partial_tensors(nblocks * 9);
 
     // Launch step B kernel on stream
     velocity_verlet_step_b_kernel<<<nblocks, BLOCK_SIZE, 0, stream>>>(
-        velocities, forces, masses, dt2, natoms, d_partial_energies, d_partial_tensors
+        velocities, forces, masses, dt2, natoms, d_partial_energies.get(), d_partial_tensors.get()
     );
     CUDA_CHECK(cudaGetLastError());
 
     // Final reduction on stream
     final_reduction_kernel<<<1, 1, 0, stream>>>(
-        d_partial_energies, d_partial_tensors, nblocks, kinetic_energy, kinetic_tensor
+        d_partial_energies.get(), d_partial_tensors.get(), nblocks, kinetic_energy, kinetic_tensor
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Synchronize before freeing temporary storage
+    // Synchronize before exiting (RAII destructors will free memory automatically)
     if (stream == 0) {
         CUDA_CHECK(cudaDeviceSynchronize());
     } else {
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-
-    // Free temporary storage
-    CUDA_CHECK(cudaFree(d_partial_energies));
-    CUDA_CHECK(cudaFree(d_partial_tensors));
+    // Memory automatically freed by RAII destructors, even if exceptions occur
 }
 
 // Kernel for scaling velocities
@@ -275,28 +301,24 @@ void compute_kinetic_energy(
 ) {
     int nblocks = (natoms + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    // Allocate temporary storage
-    double* d_partial_energies;
-    double* d_partial_tensors;
-    CUDA_CHECK(cudaMalloc(&d_partial_energies, nblocks * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_partial_tensors, nblocks * 9 * sizeof(double)));
+    // Allocate temporary storage using RAII
+    // Prevents memory leaks if CUDA_CHECK throws exception
+    CudaMemory<double> d_partial_energies(nblocks);
+    CudaMemory<double> d_partial_tensors(nblocks * 9);
 
     // Compute partial sums
     compute_kinetic_energy_kernel<<<nblocks, BLOCK_SIZE>>>(
-        velocities, masses, natoms, d_partial_energies, d_partial_tensors
+        velocities, masses, natoms, d_partial_energies.get(), d_partial_tensors.get()
     );
     CUDA_CHECK(cudaGetLastError());
 
     // Final reduction
     final_reduction_kernel<<<1, 1>>>(
-        d_partial_energies, d_partial_tensors, nblocks, kinetic_energy, kinetic_tensor
+        d_partial_energies.get(), d_partial_tensors.get(), nblocks, kinetic_energy, kinetic_tensor
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Free temporary storage
-    CUDA_CHECK(cudaFree(d_partial_energies));
-    CUDA_CHECK(cudaFree(d_partial_tensors));
+    // Memory automatically freed by RAII destructors, even if exceptions occur
 }
 
 } // namespace cuda
