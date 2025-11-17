@@ -82,6 +82,39 @@ void zbl_repulsion(
 );
 
 /**
+ * NLH (Nordlund-Lehtola-Hobler) repulsion potential
+ * Element-pair-specific repulsion potential with improved accuracy
+ *
+ * Based on: K. Nordlund, S. Lehtola, G. Hobler
+ * "Repulsive interatomic potentials calculated at three levels of theory"
+ * Physical Review A 111, 032818 (2025)
+ *
+ * E_NLH = (Z_i * Z_j * e^2 / r) * sum_k(c_k * exp(-alpha_k * r_scaled))
+ * where coefficients are pair-specific
+ *
+ * @param coordinates [natoms, 3] - atomic coordinates
+ * @param atomic_numbers [natoms] - atomic numbers (Z)
+ * @param atom_pairs [npairs, 2] - pairs of atom indices
+ * @param pair_coefficients [npairs, 6] - NLH coefficients (a1,b1,a2,b2,a3,b3) per pair
+ * @param natoms - number of atoms
+ * @param npairs - number of pairs
+ * @param cutoff - cutoff distance for NLH
+ * @param energy [out] - total NLH energy
+ * @param forces [natoms, 3, out] - NLH forces (accumulated)
+ */
+void nlh_repulsion(
+    const double* coordinates,
+    const int* atomic_numbers,
+    const int* atom_pairs,
+    const double* pair_coefficients,
+    int natoms,
+    int npairs,
+    double cutoff,
+    double* energy,
+    double* forces
+);
+
+/**
  * Dispersion (Van der Waals) interaction using C6 coefficients
  * E = -C6 / r^6
  *

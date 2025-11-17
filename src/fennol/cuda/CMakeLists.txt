@@ -21,6 +21,7 @@ set(CUDA_SOURCES
     src/restraints.cu
     src/physics.cu
     src/thermostats.cu
+    src/multi_gpu.cu
 )
 
 set(CPP_SOURCES

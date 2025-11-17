@@ -79,6 +79,33 @@ void upper_distance_restraint(
 );
 
 /**
+ * Flat-bottom distance restraint
+ * E = 0.5 * k * max(0, |r - r0| - tolerance)^2
+ * No energy penalty within target ± tolerance, harmonic outside
+ *
+ * @param coordinates [natoms, 3] - atomic coordinates
+ * @param atom_indices [nrestraints, 2] - pairs of atom indices
+ * @param target_distances [nrestraints] - target distances
+ * @param force_constants [nrestraints] - force constants
+ * @param tolerances [nrestraints] - tolerance (half-width of flat region)
+ * @param natoms - number of atoms
+ * @param nrestraints - number of restraints
+ * @param energy [out] - total restraint energy
+ * @param forces [natoms, 3, out] - restraint forces (accumulated)
+ */
+void flat_bottom_distance_restraint(
+    const double* coordinates,
+    const int* atom_indices,
+    const double* target_distances,
+    const double* force_constants,
+    const double* tolerances,
+    int natoms,
+    int nrestraints,
+    double* energy,
+    double* forces
+);
+
+/**
  * Harmonic angle restraint
  * E = 0.5 * k * (theta - theta0)^2
  *

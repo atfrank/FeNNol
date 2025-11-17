@@ -19,14 +19,16 @@ cuda/
 │   ├── common.cuh       # Common utilities (Vec3, atomics, reductions)
 │   ├── integrate.cuh    # Velocity Verlet integration
 │   ├── restraints.cuh   # Restraint force calculations
-│   ├── physics.cuh      # Physics models (LJ, Coulomb, ZBL, dispersion)
+│   ├── physics.cuh      # Physics models (LJ, Coulomb, ZBL, NLH, dispersion)
 │   ├── thermostats.cuh  # Thermostats (Berendsen, Andersen, etc.)
+│   ├── multi_gpu.cuh    # Multi-GPU domain decomposition
 │   └── colvars.cuh      # Collective variables
 ├── src/                 # CUDA implementation
 │   ├── integrate.cu     # Integration kernels
 │   ├── restraints.cu    # Restraint kernels
 │   ├── physics.cu       # Physics model kernels
 │   ├── thermostats.cu   # Thermostat kernels
+│   ├── multi_gpu.cu     # Multi-GPU implementation
 │   └── bindings.cpp     # Python bindings (pybind11)
 ├── __init__.py          # Python interface
 ├── CMakeLists.txt       # Build configuration
@@ -62,6 +64,11 @@ cuda/
 - **`upper_distance_restraint`**: One-sided upper bound
   - E = 0.5 * k * max(0, r - r0)²
 
+- **`flat_bottom_distance_restraint`**: Flat-bottom restraint
+  - E = 0.5 * k * max(0, |r - r0| - tolerance)²
+  - No penalty within tolerance region
+  - Allows controlled flexibility
+
 - **`harmonic_angle_restraint`**: Angle restraints
   - E = 0.5 * k * (θ - θ0)²
   - Full analytical force derivatives
@@ -89,6 +96,12 @@ cuda/
   - Nuclear repulsion for reactive simulations
   - ZBL universal screening function
   - Critical for bond breaking/formation
+
+- **`nlh_repulsion`**: Nordlund-Lehtola-Hobler repulsion
+  - E = (Z_i * Z_j * k_e / r) * Σ(a_k * exp(-b_k * r))
+  - Element-pair-specific coefficients for improved accuracy
+  - Based on Phys. Rev. A 111, 032818 (2025)
+  - More accurate than ZBL for specific element combinations
 
 - **`dispersion_c6`**: C6 dispersion interactions
   - E = -C6 / r⁶
@@ -131,6 +144,34 @@ cuda/
 - **`colvar_dihedral`**: Dihedral angle (four atoms)
 - **`compute_center_of_mass`**: COM calculation
 - **`colvar_rmsd`**: RMSD with Kabsch alignment (header only - implementation pending)
+
+### Multi-GPU Support (`multi_gpu.cu`)
+
+- **`initialize_multi_gpu`**: Initialize multi-GPU context
+  - Automatic GPU count detection (1 GPU per 10K atoms)
+  - Peer-to-peer access setup when available
+  - Domain decomposition with halo regions
+
+- **`distribute_atoms`**: Distribute atoms across GPUs
+  - 1D spatial decomposition along X-axis
+  - Efficient load balancing
+  - Minimizes inter-GPU communication
+
+- **`exchange_halos`**: Halo region communication
+  - Boundary atom exchange between neighboring domains
+  - Supports peer-to-peer or host-staged transfers
+  - Asynchronous communication with CUDA streams
+
+- **`multi_gpu_velocity_verlet_step_a/b`**: Multi-GPU integration
+  - Parallel execution on all GPUs
+  - Automatic force reduction across domains
+  - Minimal synchronization overhead
+
+- **`gather_coordinates/velocities/forces`**: Collect results from GPUs
+  - Efficient scatter/gather operations
+  - Used for output and analysis
+
+**Note**: Multi-GPU support is optimized for large systems (>50K atoms) where communication overhead is amortized by computational work.
 
 ## Building
 
@@ -286,13 +327,14 @@ Benchmarks on NVIDIA A100 GPU vs JAX on same hardware:
 1. **Neighbor list management**: Custom CUDA neighbor lists for force calculations
 2. **Ewald summation**: CUDA implementation of PME for electrostatics
 3. **RMSD restraints**: Full Kabsch alignment on GPU
-4. **Multi-GPU support**: Domain decomposition across GPUs
-5. **Mixed precision**: FP16 accumulation for maximum performance
+4. **3D domain decomposition**: Extend multi-GPU to 3D spatial decomposition for better scaling
+5. **NCCL integration**: Use NVIDIA NCCL for optimized multi-GPU communication
+6. **Mixed precision**: FP16 accumulation for maximum performance
 
 ### Advanced Optimizations
 
 1. **Persistent kernels**: Reduce launch overhead for small systems
-2. **Streams and concurrency**: Overlap computation and data transfer
+2. **Streams and concurrency**: Overlap computation and data transfer (partial multi-GPU support)
 3. **Tensor cores**: Leverage Tensor Cores for matrix operations
 4. **Graph capture**: CUDA graphs for repeated operation sequences
 

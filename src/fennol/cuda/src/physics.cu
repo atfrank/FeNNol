@@ -279,6 +279,110 @@ void zbl_repulsion(
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+// NLH repulsion kernel
+// Based on Nordlund-Lehtola-Hobler pair-specific repulsion model
+// Uses three exponential terms with pair-specific coefficients
+__global__ void nlh_kernel(
+    const double* coordinates,
+    const int* atomic_numbers,
+    const int* atom_pairs,
+    const double* pair_coefficients,
+    int npairs,
+    double cutoff,
+    double* partial_energies,
+    double* forces
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= npairs) return;
+
+    int i = atom_pairs[idx * 2 + 0];
+    int j = atom_pairs[idx * 2 + 1];
+
+    Vec3 ri(coordinates[i * 3 + 0], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
+    Vec3 rj(coordinates[j * 3 + 0], coordinates[j * 3 + 1], coordinates[j * 3 + 2]);
+
+    Vec3 rij = rj - ri;
+    double r = rij.norm();
+
+    if (r < 1e-10 || r > cutoff) {
+        partial_energies[idx] = 0.0;
+        return;
+    }
+
+    int Zi = atomic_numbers[i];
+    int Zj = atomic_numbers[j];
+
+    // Get pair-specific coefficients (a1, b1, a2, b2, a3, b3)
+    double a1 = pair_coefficients[idx * 6 + 0];
+    double b1 = pair_coefficients[idx * 6 + 1];
+    double a2 = pair_coefficients[idx * 6 + 2];
+    double b2 = pair_coefficients[idx * 6 + 3];
+    double a3 = pair_coefficients[idx * 6 + 4];
+    double b3 = pair_coefficients[idx * 6 + 5];
+
+    // NLH potential: E = (Z_i * Z_j * k_e / r) * phi(r)
+    // phi(r) = a1*exp(-b1*r) + a2*exp(-b2*r) + a3*exp(-b3*r)
+    double ke = 14.3996; // eV*Angstrom (Coulomb constant)
+
+    double exp1 = exp(-b1 * r);
+    double exp2 = exp(-b2 * r);
+    double exp3 = exp(-b3 * r);
+
+    double phi = a1 * exp1 + a2 * exp2 + a3 * exp3;
+    double dphi_dr = -(a1 * b1 * exp1 + a2 * b2 * exp2 + a3 * b3 * exp3);
+
+    double energy = ke * Zi * Zj * phi / r;
+    partial_energies[idx] = energy;
+
+    // Force: F = -dE/dr = -ke * Zi * Zj * d/dr(phi/r)
+    // d/dr(phi/r) = (dphi_dr * r - phi) / r^2
+    double dE_dr = -ke * Zi * Zj * (dphi_dr / r - phi / (r * r));
+    Vec3 force_vec = rij * (-dE_dr / r);
+
+    for (int d = 0; d < 3; ++d) {
+        double f = (d == 0) ? force_vec.x : (d == 1) ? force_vec.y : force_vec.z;
+        atomicAddDouble(&forces[i * 3 + d], f);
+        atomicAddDouble(&forces[j * 3 + d], -f);
+    }
+}
+
+void nlh_repulsion(
+    const double* coordinates,
+    const int* atomic_numbers,
+    const int* atom_pairs,
+    const double* pair_coefficients,
+    int natoms,
+    int npairs,
+    double cutoff,
+    double* energy,
+    double* forces
+) {
+    double* d_partial_energies;
+    CUDA_CHECK(cudaMalloc(&d_partial_energies, npairs * sizeof(double)));
+
+    int nblocks = (npairs + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    nlh_kernel<<<nblocks, BLOCK_SIZE>>>(
+        coordinates, atomic_numbers, atom_pairs, pair_coefficients, npairs, cutoff,
+        d_partial_energies, forces
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    double* h_partial_energies = new double[npairs];
+    CUDA_CHECK(cudaMemcpy(h_partial_energies, d_partial_energies,
+                          npairs * sizeof(double), cudaMemcpyDeviceToHost));
+
+    double total_energy = 0.0;
+    for (int i = 0; i < npairs; ++i) {
+        total_energy += h_partial_energies[i];
+    }
+    *energy = total_energy;
+
+    delete[] h_partial_energies;
+    CUDA_CHECK(cudaFree(d_partial_energies));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 // Dispersion C6 kernel
 __global__ void dispersion_kernel(
     const double* coordinates,

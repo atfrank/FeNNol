@@ -243,6 +243,96 @@ void upper_distance_restraint(
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+// Flat-bottom distance restraint kernel
+__global__ void flat_bottom_distance_restraint_kernel(
+    const double* coordinates,
+    const int* atom_indices,
+    const double* target_distances,
+    const double* force_constants,
+    const double* tolerances,
+    int nrestraints,
+    double* partial_energies,
+    double* forces
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nrestraints) return;
+
+    int i = atom_indices[idx * 2 + 0];
+    int j = atom_indices[idx * 2 + 1];
+
+    Vec3 ri(coordinates[i * 3 + 0], coordinates[i * 3 + 1], coordinates[i * 3 + 2]);
+    Vec3 rj(coordinates[j * 3 + 0], coordinates[j * 3 + 1], coordinates[j * 3 + 2]);
+
+    Vec3 rij = rj - ri;
+    double r = rij.norm();
+
+    double r0 = target_distances[idx];
+    double k = force_constants[idx];
+    double tol = tolerances[idx];
+
+    // Calculate deviation from target
+    double diff = r - r0;
+    double abs_diff = fabs(diff);
+
+    // Calculate violation (how far outside the flat region)
+    double violation = fmax(0.0, abs_diff - tol);
+
+    // Energy is 0.5*k*violation^2
+    double energy = 0.5 * k * violation * violation;
+    partial_energies[idx] = energy;
+
+    // Force is k*violation*sign(diff)
+    // Only non-zero when outside the tolerance
+    if (violation > 1e-10 && r > 1e-10) {
+        double sign = (diff > 0) ? 1.0 : -1.0;
+        double force_mag = k * violation * sign;
+        Vec3 force_dir = rij * (force_mag / r);
+
+        for (int d = 0; d < 3; ++d) {
+            double f = (d == 0) ? force_dir.x : (d == 1) ? force_dir.y : force_dir.z;
+            atomicAddDouble(&forces[i * 3 + d], f);
+            atomicAddDouble(&forces[j * 3 + d], -f);
+        }
+    }
+}
+
+void flat_bottom_distance_restraint(
+    const double* coordinates,
+    const int* atom_indices,
+    const double* target_distances,
+    const double* force_constants,
+    const double* tolerances,
+    int natoms,
+    int nrestraints,
+    double* energy,
+    double* forces
+) {
+    double* d_partial_energies;
+    CUDA_CHECK(cudaMalloc(&d_partial_energies, nrestraints * sizeof(double)));
+
+    int nblocks = (nrestraints + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    flat_bottom_distance_restraint_kernel<<<nblocks, BLOCK_SIZE>>>(
+        coordinates, atom_indices, target_distances, force_constants, tolerances,
+        nrestraints, d_partial_energies, forces
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    double* h_partial_energies = new double[nrestraints];
+    CUDA_CHECK(cudaMemcpy(h_partial_energies, d_partial_energies,
+                          nrestraints * sizeof(double), cudaMemcpyDeviceToHost));
+
+    double total_energy = 0.0;
+    for (int i = 0; i < nrestraints; ++i) {
+        total_energy += h_partial_energies[i];
+    }
+    CUDA_CHECK(cudaMemcpy(energy, &total_energy, sizeof(double), cudaMemcpyHostToDevice));
+
+    delete[] h_partial_energies;
+    CUDA_CHECK(cudaFree(d_partial_energies));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 // Harmonic angle restraint kernel
 __global__ void harmonic_angle_restraint_kernel(
     const double* coordinates,
