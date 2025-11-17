@@ -19,6 +19,8 @@ endif()
 set(CUDA_SOURCES
     src/integrate.cu
     src/restraints.cu
+    src/physics.cu
+    src/thermostats.cu
 )
 
 set(CPP_SOURCES

@@ -403,9 +403,47 @@ __global__ void harmonic_dihedral_restraint_kernel(
     double energy = 0.5 * force_constant * dphi * dphi;
     partial_energies[idx] = energy;
 
-    // Force computation (simplified - full derivative is complex)
-    // For now, we'll use a simplified numerical gradient approach
-    // In production, you'd want the analytical derivatives
+    // Analytical force calculation for dihedral
+    // dE/dphi = k * dphi
+    double dE_dphi = force_constant * dphi;
+
+    // Get bond lengths
+    double r_ij = rij.norm();
+    double r_jk = rjk.norm();
+    double r_kl = rkl.norm();
+
+    if (r_jk < 1e-10) return; // Avoid division by zero
+
+    // Compute forces using analytical derivatives
+    // Based on standard dihedral force formulation
+    Vec3 n1_unit = n1 * (1.0 / n1_norm);
+    Vec3 n2_unit = n2 * (1.0 / n2_norm);
+
+    // Force on atom i
+    Vec3 fi = n1_unit * (dE_dphi / (n1_norm * r_jk));
+
+    // Force on atom l
+    Vec3 fl = n2_unit * (-dE_dphi / (n2_norm * r_jk));
+
+    // Forces on atoms j and k (more complex)
+    double dot_ij_jk = rij.dot(rjk) / (r_jk * r_jk);
+    double dot_kl_jk = rkl.dot(rjk) / (r_jk * r_jk);
+
+    Vec3 fj = fi * (-1.0 + dot_ij_jk) + fl * (-dot_kl_jk);
+    Vec3 fk = fi * (-dot_ij_jk) + fl * (1.0 - dot_kl_jk);
+
+    // Add forces atomically
+    for (int d = 0; d < 3; ++d) {
+        double f_i = (d == 0) ? fi.x : (d == 1) ? fi.y : fi.z;
+        double f_j = (d == 0) ? fj.x : (d == 1) ? fj.y : fj.z;
+        double f_k = (d == 0) ? fk.x : (d == 1) ? fk.y : fk.z;
+        double f_l = (d == 0) ? fl.x : (d == 1) ? fl.y : fl.z;
+
+        atomicAddDouble(&forces[i * 3 + d], f_i);
+        atomicAddDouble(&forces[j * 3 + d], f_j);
+        atomicAddDouble(&forces[k * 3 + d], f_k);
+        atomicAddDouble(&forces[l * 3 + d], f_l);
+    }
 }
 
 void harmonic_dihedral_restraint(

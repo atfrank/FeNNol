@@ -15,17 +15,22 @@ The CUDA native refactoring replaces JAX JIT compilation with hand-optimized CUD
 
 ```
 cuda/
-├── include/           # CUDA header files
-│   ├── common.cuh     # Common utilities (Vec3, atomics, reductions)
-│   ├── integrate.cuh  # Velocity Verlet integration
-│   └── restraints.cuh # Restraint force calculations
-├── src/               # CUDA implementation
-│   ├── integrate.cu   # Integration kernels
-│   ├── restraints.cu  # Restraint kernels
-│   └── bindings.cpp   # Python bindings (pybind11)
-├── __init__.py        # Python interface
-├── CMakeLists.txt     # Build configuration
-└── README.md          # This file
+├── include/             # CUDA header files
+│   ├── common.cuh       # Common utilities (Vec3, atomics, reductions)
+│   ├── integrate.cuh    # Velocity Verlet integration
+│   ├── restraints.cuh   # Restraint force calculations
+│   ├── physics.cuh      # Physics models (LJ, Coulomb, ZBL, dispersion)
+│   ├── thermostats.cuh  # Thermostats (Berendsen, Andersen, etc.)
+│   └── colvars.cuh      # Collective variables
+├── src/                 # CUDA implementation
+│   ├── integrate.cu     # Integration kernels
+│   ├── restraints.cu    # Restraint kernels
+│   ├── physics.cu       # Physics model kernels
+│   ├── thermostats.cu   # Thermostat kernels
+│   └── bindings.cpp     # Python bindings (pybind11)
+├── __init__.py          # Python interface
+├── CMakeLists.txt       # Build configuration
+└── README.md            # This file
 ```
 
 ## Implemented Kernels
@@ -67,6 +72,65 @@ cuda/
 
 - **`spherical_boundary_restraint`**: Spherical confinement
 - **`rmsd_restraint`**: RMSD-based restraints (placeholder)
+
+### Physics Models (`physics.cu`)
+
+- **`lennard_jones_pairwise`**: Lennard-Jones 12-6 potential
+  - E = 4ε[(σ/r)¹² - (σ/r)⁶]
+  - Pairwise non-bonded interactions
+  - Optimized for large pair lists
+
+- **`coulomb_direct`**: Direct Coulomb electrostatics
+  - E = k_e * q_i * q_j / r
+  - No periodicity (for gas-phase or cluster simulations)
+  - Fast pairwise evaluation
+
+- **`zbl_repulsion`**: Ziegler-Biersack-Littmark repulsion
+  - Nuclear repulsion for reactive simulations
+  - ZBL universal screening function
+  - Critical for bond breaking/formation
+
+- **`dispersion_c6`**: C6 dispersion interactions
+  - E = -C6 / r⁶
+  - Van der Waals dispersion
+  - Element-specific C6 coefficients
+
+- **`harmonic_bonds`**: Bonded topology - bond stretching
+  - E = 0.5 * k * (r - r0)²
+  - Fast evaluation for bonded systems
+
+- **`harmonic_angles`**: Bonded topology - angle bending
+  - E = 0.5 * k * (θ - θ0)²
+  - Analytical force derivatives
+
+### Thermostats (`thermostats.cu`)
+
+- **`velocity_rescale_thermostat`**: Simple velocity rescaling
+  - Instantaneous temperature control
+  - v_new = v * sqrt(T_target / T_current)
+  - Fast and deterministic
+
+- **`berendsen_thermostat`**: Berendsen weak coupling
+  - Exponential relaxation to target temperature
+  - lambda = sqrt(1 + dt/tau * (T_target/T_current - 1))
+  - Configurable coupling time constant
+
+- **`andersen_thermostat`**: Andersen stochastic collisions
+  - Random velocity reassignment from Maxwell-Boltzmann
+  - Configurable collision frequency
+  - Proper canonical ensemble sampling
+
+- **`compute_temperature`**: Instantaneous temperature calculation
+  - T = 2*KE / (k_B * N_dof)
+  - Efficient parallel reduction
+
+### Collective Variables (`colvars.cuh`)
+
+- **`colvar_distance`**: Distance between two atoms
+- **`colvar_angle`**: Angle formed by three atoms
+- **`colvar_dihedral`**: Dihedral angle (four atoms)
+- **`compute_center_of_mass`**: COM calculation
+- **`colvar_rmsd`**: RMSD with Kabsch alignment (header only - implementation pending)
 
 ## Building
 
