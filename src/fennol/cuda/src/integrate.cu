@@ -48,16 +48,21 @@ void velocity_verlet_step_a(
     const double* forces,
     const double* masses,
     double dt,
-    int natoms
+    int natoms,
+    cudaStream_t stream
 ) {
     double dt2 = 0.5 * dt;
     int nblocks = (natoms + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    velocity_verlet_step_a_kernel<<<nblocks, BLOCK_SIZE>>>(
+    velocity_verlet_step_a_kernel<<<nblocks, BLOCK_SIZE, 0, stream>>>(
         coordinates, velocities, forces, masses, dt, dt2, natoms
     );
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Only synchronize if using default stream (for backward compatibility)
+    if (stream == 0) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
 }
 
 // Kernel for velocity Verlet step B
@@ -152,7 +157,8 @@ void velocity_verlet_step_b(
     double dt,
     int natoms,
     double* kinetic_energy,
-    double* kinetic_tensor
+    double* kinetic_tensor,
+    cudaStream_t stream
 ) {
     double dt2 = 0.5 * dt;
     int nblocks = (natoms + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -163,18 +169,24 @@ void velocity_verlet_step_b(
     CUDA_CHECK(cudaMalloc(&d_partial_energies, nblocks * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_partial_tensors, nblocks * 9 * sizeof(double)));
 
-    // Launch step B kernel
-    velocity_verlet_step_b_kernel<<<nblocks, BLOCK_SIZE>>>(
+    // Launch step B kernel on stream
+    velocity_verlet_step_b_kernel<<<nblocks, BLOCK_SIZE, 0, stream>>>(
         velocities, forces, masses, dt2, natoms, d_partial_energies, d_partial_tensors
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Final reduction
-    final_reduction_kernel<<<1, 1>>>(
+    // Final reduction on stream
+    final_reduction_kernel<<<1, 1, 0, stream>>>(
         d_partial_energies, d_partial_tensors, nblocks, kinetic_energy, kinetic_tensor
     );
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Synchronize before freeing temporary storage
+    if (stream == 0) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     // Free temporary storage
     CUDA_CHECK(cudaFree(d_partial_energies));

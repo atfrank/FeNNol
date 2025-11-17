@@ -2,7 +2,7 @@
 
 This document tracks known bugs and issues in the CUDA native implementation that require future attention.
 
-## Critical Bugs (Fixed in commits 1c9ad81, a3f29aa)
+## Critical Bugs (Fixed in commits 1c9ad81, a3f29aa, 5871e3c)
 
 The following critical bugs were discovered through comprehensive code review and have been **FIXED**:
 
@@ -12,42 +12,26 @@ The following critical bugs were discovered through comprehensive code review an
 ✅ **Backside attack restraint** - Incorrect energy return method (commit 1c9ad81)
 ✅ **ZBL repulsion** - Wrong force derivative formula (commit 1c9ad81)
 ✅ **NLH repulsion** - Extra negative sign in force calculation (commit 1c9ad81)
-✅ **Python bindings** - Memory leaks on CUDA errors (RAII wrappers - current commit)
-✅ **Python bindings** - Missing input validation (comprehensive validation - current commit)
-✅ **Multi-GPU** - Memory freed before kernel completion (synchronization added - current commit)
-✅ **Multi-GPU** - Uninitialized pointers in GPUDomain (all pointers initialized - current commit)
-✅ **Multi-GPU** - Boundary atom assignment bug (inclusive upper bound - current commit)
-✅ **Multi-GPU** - Missing cudaSetDevice error checking (CUDA_CHECK_MULTI added - current commit)
-✅ **Documentation** - Incorrect Velocity Verlet description (integrate.cuh fixed - current commit)
-✅ **Code quality** - Dead code removed (get_device_ptr() removed - current commit)
+✅ **Python bindings** - Memory leaks on CUDA errors (RAII wrappers - commit 5871e3c)
+✅ **Python bindings** - Missing input validation (comprehensive validation - commit 5871e3c)
+✅ **Multi-GPU** - Memory freed before kernel completion (synchronization added - commit 5871e3c)
+✅ **Multi-GPU** - Uninitialized pointers in GPUDomain (all pointers initialized - commit 5871e3c)
+✅ **Multi-GPU** - Boundary atom assignment bug (inclusive upper bound - commit 5871e3c)
+✅ **Multi-GPU** - Missing cudaSetDevice error checking (CUDA_CHECK_MULTI added - commit 5871e3c)
+✅ **Multi-GPU** - Kernels not using streams (stream support added - current commit)
+✅ **Multi-GPU** - Sequential GPU processing (async launch/sync/gather phases - current commit)
+✅ **Documentation** - Incorrect Velocity Verlet description (integrate.cuh fixed - commit 5871e3c)
+✅ **Code quality** - Dead code removed (get_device_ptr() removed - commit 5871e3c)
 
 ---
 
 ## High Priority Issues (Require Fixing)
 
-### 1. Multi-GPU Synchronization Bugs
+### 1. Multi-GPU - Halo Exchange
 
 **File:** `src/fennol/cuda/src/multi_gpu.cu`
 
-#### Issue #1: Kernels Not Using Streams
-**Lines:** 286-293, 338-346
-**Severity:** HIGH - Breaks multi-GPU parallelism
-
-Kernels are launched on the default stream, not the per-GPU streams, defeating the purpose of multi-GPU parallelization.
-
-**Fix Required:** Pass stream parameter to integration functions or use stream-aware kernel launches.
-
-**Note:** This requires modifying the `velocity_verlet_step_a/b` function signatures in `integrate.cuh` to accept a `cudaStream_t` parameter, which is a more extensive refactoring.
-
-#### Issue #2: Sequential GPU Processing
-**Lines:** 313-362
-**Severity:** HIGH - Defeats parallelism
-
-The loop processes each GPU sequentially with blocking memory copies instead of launching all kernels in parallel.
-
-**Fix Required:** Split into async launch phase and sync/gather phase.
-
-#### Issue #3: Halo Exchange Not Implemented
+#### Issue #1: Halo Exchange Not Implemented
 **Lines:** 232-257
 **Severity:** HIGH - Produces incorrect results
 

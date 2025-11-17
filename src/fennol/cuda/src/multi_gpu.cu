@@ -285,7 +285,10 @@ void multi_gpu_velocity_verlet_step_a(
     const double* forces,
     double dt
 ) {
-    // Launch step A on all GPUs in parallel
+    // Store temporary device pointers for cleanup
+    std::vector<double*> d_forces_locals(ctx->ngpus);
+
+    // PHASE 1: Launch kernels on all GPUs asynchronously
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
         CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
@@ -299,27 +302,34 @@ void multi_gpu_velocity_verlet_step_a(
             }
         }
 
-        // Copy forces to device
-        double* d_forces_local;
-        CUDA_CHECK_MULTI(cudaMalloc(&d_forces_local, domain->natoms_local * 3 * sizeof(double)), gpu);
-        CUDA_CHECK_MULTI(cudaMemcpy(d_forces_local, local_forces.data(),
+        // Allocate and copy forces to device asynchronously
+        CUDA_CHECK_MULTI(cudaMalloc(&d_forces_locals[gpu], domain->natoms_local * 3 * sizeof(double)), gpu);
+        CUDA_CHECK_MULTI(cudaMemcpyAsync(d_forces_locals[gpu], local_forces.data(),
                                     domain->natoms_local * 3 * sizeof(double),
-                                    cudaMemcpyHostToDevice), gpu);
+                                    cudaMemcpyHostToDevice, ctx->streams[gpu]), gpu);
 
-        // Execute step A on this GPU
-        // TODO: Pass stream to kernel for true async execution
+        // Execute step A on this GPU using stream (async)
         velocity_verlet_step_a(
             domain->d_coordinates,
             domain->d_velocities,
-            d_forces_local,
+            d_forces_locals[gpu],
             domain->d_masses,
             dt,
-            domain->natoms_local
+            domain->natoms_local,
+            ctx->streams[gpu]  // Use per-GPU stream for async execution
         );
+    }
 
-        // CRITICAL: Synchronize before freeing memory
-        CUDA_CHECK_MULTI(cudaDeviceSynchronize(), gpu);
-        cudaFree(d_forces_local);
+    // PHASE 2: Synchronize all GPUs
+    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+        CUDA_CHECK_MULTI(cudaStreamSynchronize(ctx->streams[gpu]), gpu);
+    }
+
+    // PHASE 3: Cleanup temporary memory
+    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+        cudaFree(d_forces_locals[gpu]);
     }
 
     // Exchange halo regions after position update
@@ -333,10 +343,12 @@ void multi_gpu_velocity_verlet_step_b(
     double* kinetic_energy,
     double* kinetic_tensor
 ) {
-    double total_ke = 0.0;
-    double total_tensor[9] = {0.0};
+    // Store temporary device pointers for cleanup
+    std::vector<double*> d_forces_locals(ctx->ngpus);
+    std::vector<double*> d_kes(ctx->ngpus);
+    std::vector<double*> d_ke_tensors(ctx->ngpus);
 
-    // Launch step B on all GPUs in parallel
+    // PHASE 1: Launch kernels on all GPUs asynchronously
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
         CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
@@ -350,47 +362,62 @@ void multi_gpu_velocity_verlet_step_b(
             }
         }
 
-        double* d_forces_local;
-        CUDA_CHECK_MULTI(cudaMalloc(&d_forces_local, domain->natoms_local * 3 * sizeof(double)), gpu);
-        CUDA_CHECK_MULTI(cudaMemcpy(d_forces_local, local_forces.data(),
+        // Allocate device memory
+        CUDA_CHECK_MULTI(cudaMalloc(&d_forces_locals[gpu], domain->natoms_local * 3 * sizeof(double)), gpu);
+        CUDA_CHECK_MULTI(cudaMalloc(&d_kes[gpu], sizeof(double)), gpu);
+        CUDA_CHECK_MULTI(cudaMalloc(&d_ke_tensors[gpu], 9 * sizeof(double)), gpu);
+
+        // Copy forces to device asynchronously
+        CUDA_CHECK_MULTI(cudaMemcpyAsync(d_forces_locals[gpu], local_forces.data(),
                                     domain->natoms_local * 3 * sizeof(double),
-                                    cudaMemcpyHostToDevice), gpu);
+                                    cudaMemcpyHostToDevice, ctx->streams[gpu]), gpu);
 
-        // Allocate output
-        double *d_ke, *d_ke_tensor;
-        CUDA_CHECK_MULTI(cudaMalloc(&d_ke, sizeof(double)), gpu);
-        CUDA_CHECK_MULTI(cudaMalloc(&d_ke_tensor, 9 * sizeof(double)), gpu);
-
-        // Execute step B
-        // TODO: Pass stream to kernel for true async execution
+        // Execute step B on this GPU using stream (async)
         velocity_verlet_step_b(
             domain->d_velocities,
-            d_forces_local,
+            d_forces_locals[gpu],
             domain->d_masses,
             dt,
             domain->natoms_local,
-            d_ke,
-            d_ke_tensor
+            d_kes[gpu],
+            d_ke_tensors[gpu],
+            ctx->streams[gpu]  // Use per-GPU stream for async execution
         );
+    }
 
-        // Copy results back and accumulate
+    // PHASE 2: Synchronize all GPUs
+    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+        CUDA_CHECK_MULTI(cudaStreamSynchronize(ctx->streams[gpu]), gpu);
+    }
+
+    // PHASE 3: Gather results and accumulate
+    double total_ke = 0.0;
+    double total_tensor[9] = {0.0};
+
+    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+
         double local_ke;
         double local_tensor[9];
-        CUDA_CHECK_MULTI(cudaMemcpy(&local_ke, d_ke, sizeof(double), cudaMemcpyDeviceToHost), gpu);
-        CUDA_CHECK_MULTI(cudaMemcpy(local_tensor, d_ke_tensor, 9 * sizeof(double), cudaMemcpyDeviceToHost), gpu);
+        CUDA_CHECK_MULTI(cudaMemcpy(&local_ke, d_kes[gpu], sizeof(double), cudaMemcpyDeviceToHost), gpu);
+        CUDA_CHECK_MULTI(cudaMemcpy(local_tensor, d_ke_tensors[gpu], 9 * sizeof(double), cudaMemcpyDeviceToHost), gpu);
 
         total_ke += local_ke;
         for (int i = 0; i < 9; ++i) {
             total_tensor[i] += local_tensor[i];
         }
-
-        // CRITICAL: Synchronize before freeing memory
-        CUDA_CHECK_MULTI(cudaDeviceSynchronize(), gpu);
-        cudaFree(d_forces_local);
-        cudaFree(d_ke);
-        cudaFree(d_ke_tensor);
     }
 
+    // PHASE 4: Cleanup temporary memory
+    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+        cudaFree(d_forces_locals[gpu]);
+        cudaFree(d_kes[gpu]);
+        cudaFree(d_ke_tensors[gpu]);
+    }
+
+    // Return total values
     *kinetic_energy = total_ke;
     for (int i = 0; i < 9; ++i) {
         kinetic_tensor[i] = total_tensor[i];

@@ -19,6 +19,7 @@ namespace cuda {
  * @param masses [natoms] - atomic masses
  * @param dt - timestep
  * @param natoms - number of atoms
+ * @param stream - CUDA stream for async execution (default: 0 = default stream)
  */
 void velocity_verlet_step_a(
     double* coordinates,
@@ -26,7 +27,8 @@ void velocity_verlet_step_a(
     const double* forces,
     const double* masses,
     double dt,
-    int natoms
+    int natoms,
+    cudaStream_t stream = 0
 );
 
 /**
@@ -42,6 +44,7 @@ void velocity_verlet_step_a(
  * @param natoms - number of atoms
  * @param kinetic_energy [out] - computed kinetic energy
  * @param kinetic_tensor [9, out] - computed kinetic energy tensor (row-major)
+ * @param stream - CUDA stream for async execution (default: 0 = default stream)
  */
 void velocity_verlet_step_b(
     double* velocities,
@@ -50,7 +53,8 @@ void velocity_verlet_step_b(
     double dt,
     int natoms,
     double* kinetic_energy,
-    double* kinetic_tensor
+    double* kinetic_tensor,
+    cudaStream_t stream = 0
 );
 
 /**
