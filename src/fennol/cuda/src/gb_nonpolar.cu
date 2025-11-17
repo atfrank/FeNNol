@@ -36,7 +36,7 @@ __global__ void compute_nonpolar_energy_kernel(
     double E_np = gamma_i * SA_i;
 
     // Accumulate to total energy
-    atomicAdd(energy, E_np);
+    atomicAddDouble(energy, E_np);
 }
 
 /**

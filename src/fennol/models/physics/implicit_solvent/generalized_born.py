@@ -53,7 +53,9 @@ class GeneralizedBorn(ImplicitSolventModel):
 
         # GB-specific parameters
         self.solute_dielectric = 1.0  # Interior dielectric
-        self.gb_factor = 0.5 * (1.0 / self.solute_dielectric - 1.0 / self.dielectric)
+        # GB factor: -0.5 * (1 - 1/ε) for solvation free energy
+        # Negative sign gives favorable (negative) solvation energy
+        self.gb_factor = -0.5 * (1.0 / self.solute_dielectric - 1.0 / self.dielectric)
 
         print(f"# Initialized {self.variant.upper()} Generalized Born model")
         print(f"#   Dielectric: {self.dielectric}")
@@ -271,7 +273,9 @@ class GeneralizedBorn(ImplicitSolventModel):
         if box is not None:
             dr = dr - jnp.round(dr / jnp.diag(box)) * jnp.diag(box)
 
-        r = jnp.linalg.norm(dr, axis=-1)
+        # Use safe norm to avoid NaN gradients at r=0 (self-interactions)
+        r_squared = jnp.sum(dr**2, axis=-1)
+        r = jnp.sqrt(r_squared + 1e-10)  # Add small epsilon for gradient stability
 
         # GB function: f_GB = sqrt(r² + R_iR_j * exp(-r²/4R_iR_j))
         R_i = born_radii[:, None]
@@ -280,30 +284,38 @@ class GeneralizedBorn(ImplicitSolventModel):
 
         # Prevent numerical issues
         r_safe = jnp.maximum(r, 0.001)
-        exp_term = jnp.exp(-r_safe**2 / (4.0 * R_product))
+
+        # Apply cutoff mask before computing expensive exponentials
+        cutoff_mask = r_safe < self.cutoff
+
+        # Only compute exp for pairs within cutoff
+        exp_term = jnp.where(cutoff_mask, jnp.exp(-r_safe**2 / (4.0 * R_product)), 0.0)
 
         f_GB = jnp.sqrt(r_safe**2 + R_product * exp_term)
 
-        # Apply cutoff smoothly
-        cutoff_mask = r < self.cutoff
-        f_GB = jnp.where(cutoff_mask, f_GB, 1e10)  # Large value outside cutoff
+        # For pairs outside cutoff, set f_GB to a large value to make energy ~0
+        # Use r itself for far pairs to avoid discontinuity
+        f_GB = jnp.where(cutoff_mask, f_GB, r_safe + 1000.0)
 
         # Electrostatic interaction
         q_i = charges[:, None]
         q_j = charges[None, :]
         q_product = q_i * q_j
 
-        # GB energy: E = -½ * prefactor * Σᵢⱼ qᵢqⱼ / f_GB
-        energy = -self.gb_factor * COULOMB_CONSTANT * jnp.sum(q_product / f_GB)
+        # GB energy: E = gb_factor * COULOMB * Σᵢⱼ qᵢqⱼ / f_GB
+        # gb_factor already includes negative sign for favorable solvation
+        # Mask self-interactions (diagonal) to avoid double-counting
+        mask = jnp.eye(len(charges))
+        interaction_term = jnp.where(mask, 0.0, q_product / f_GB)
 
-        # Divide by 2 to avoid double-counting (upper triangle only)
-        energy = energy / 2.0
+        # Sum pairwise interactions and divide by 2 (each pair counted twice)
+        pairwise_energy = 0.5 * self.gb_factor * COULOMB_CONSTANT * jnp.sum(interaction_term)
 
-        # Subtract self-energy (Born self-solvation)
-        self_energy = -self.gb_factor * COULOMB_CONSTANT * jnp.sum(
-            charges**2 / born_radii
-        )
-        energy = energy - self_energy
+        # Self-energy (Born self-solvation): each atom with itself
+        self_energy = self.gb_factor * COULOMB_CONSTANT * jnp.sum(charges**2 / born_radii)
+
+        # Total energy
+        energy = pairwise_energy + self_energy
 
         return energy
 

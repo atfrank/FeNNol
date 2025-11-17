@@ -7,6 +7,7 @@
 #include "../include/physics.cuh"
 #include "../include/thermostats.cuh"
 #include "../include/implicit_solvent.cuh"
+#include "../include/gnn_solvent.cuh"
 
 namespace py = pybind11;
 
@@ -759,6 +760,52 @@ py::tuple py_gb_compute_nonpolar(
     return py::make_tuple(energy, forces);
 }
 
+/**
+ * Python wrapper for GNN force prediction.
+ */
+py::array_t<double> py_gnn_predict_forces(
+    py::array_t<double> coordinates,
+    py::array_t<int> atomic_numbers,
+    int solvent_id,
+    double cutoff
+) {
+    auto coords_buf = coordinates.request();
+    auto atomic_buf = atomic_numbers.request();
+
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+
+    int natoms = coords_buf.shape[0];
+
+    if (atomic_buf.shape[0] != natoms) {
+        throw std::runtime_error("Atomic numbers array size mismatch");
+    }
+
+    // Allocate device memory
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<int> d_atomic_numbers(natoms);
+    CudaMemory<double> d_forces(natoms * 3);
+
+    // Copy to device
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_atomic_numbers.copy_to_device(atomic_buf.ptr);
+
+    // Call CUDA function
+    gnn::gnn_predict_forces(
+        natoms,
+        d_coords.get(),
+        d_atomic_numbers.get(),
+        solvent_id,
+        cutoff,
+        d_forces.get()
+    );
+
+    // Copy result to host
+    auto forces = py::array_t<double>({natoms, 3});
+    d_forces.copy_from_device(forces.request().ptr);
+
+    return forces;
+}
+
 } // namespace cuda
 } // namespace fennol
 
@@ -827,4 +874,10 @@ PYBIND11_MODULE(fennol_cuda, m) {
           "Compute non-polar (surface area) energy and forces",
           py::arg("coordinates"), py::arg("born_radii"), py::arg("gamma_params"),
           py::arg("probe_radius"));
+
+    // GNN implicit solvent functions
+    m.def("gnn_predict_forces", &fennol::cuda::py_gnn_predict_forces,
+          "Predict solvation forces using GNN model",
+          py::arg("coordinates"), py::arg("atomic_numbers"), py::arg("solvent_id"),
+          py::arg("cutoff"));
 }

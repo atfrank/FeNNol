@@ -1,0 +1,11 @@
+{
+  "watersmall": {
+    "cuda:0": {
+      "success": false,
+      "wall_time": 1.8320658206939697,
+      "timings": {},
+      "output": "Traceback (most recent call last):\n  File \"/home/aaron/miniforge3/envs/fennol-claude-dev-cuda/bin/fennol_md\", line 7, in <module>\n    sys.exit(main())\n             ~~~~^^\n  File \"/home/aaron/ATX/software/ATF-FeNNol/v4/FeNNol/src/fennol/md/dynamic.py\", line 58, in main\n    simulation_parameters = parse_input(args.param_file)\n  File \"/home/aaron/ATX/software/ATF-FeNNol/v4/FeNNol/src/fennol/utils/input_parser.py\", line 73, in parse_input\n    f=open(input_file,'r')\nFileNotFoundError: [Errno 2] No such file or directory: 'benchmark_runs/watersmall/input_cuda_0.fnl'\n",
+      "returncode": 1
+    }
+  }
+}

@@ -11,12 +11,14 @@ Supported models include:
 
 from .base import ImplicitSolventModel
 from .generalized_born import GeneralizedBorn, OBC
+from .gnn_solvent import GNNImplicitSolvent
 from .parameters import AtomicParameters
 
 __all__ = [
     "ImplicitSolventModel",
     "GeneralizedBorn",
     "OBC",
+    "GNNImplicitSolvent",
     "AtomicParameters",
 ]
 
@@ -25,6 +27,7 @@ MODEL_REGISTRY = {
     "GB": GeneralizedBorn,
     "GBSA": GeneralizedBorn,
     "OBC": OBC,
+    "GNN": GNNImplicitSolvent,
     # Future models:
     # "PB": PoissonBoltzmann,
     # "COSMO": COSMO,

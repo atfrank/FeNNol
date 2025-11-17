@@ -36,6 +36,8 @@ set(CUDA_SOURCES
     src/gb_born_radii.cu
     src/gb_energy_forces.cu
     src/gb_nonpolar.cu
+    src/gnn_neighborlist.cu
+    src/gnn_message_passing.cu
 )
 
 set(CPP_SOURCES

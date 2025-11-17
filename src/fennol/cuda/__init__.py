@@ -28,7 +28,10 @@ __all__ = [
     'harmonic_distance_restraint',
     'harmonic_angle_restraint',
     'CudaIntegrator',
-    'CudaRestraints'
+    'CudaRestraints',
+    'gb_compute_born_radii',
+    'gb_compute_energy_forces',
+    'gb_compute_nonpolar'
 ]
 
 
@@ -160,6 +163,95 @@ def harmonic_angle_restraint(
     fcs = np.ascontiguousarray(force_constants, dtype=np.float64)
 
     return fennol_cuda.harmonic_angle_restraint(coords, indices, targets, fcs)
+
+
+def gb_compute_born_radii(
+    coordinates: np.ndarray,
+    intrinsic_radii: np.ndarray,
+    b_params: np.ndarray,
+    c_params: np.ndarray,
+    cutoff: float
+) -> np.ndarray:
+    """
+    Compute Born radii using OBC method.
+
+    Args:
+        coordinates: (natoms, 3) atomic coordinates
+        intrinsic_radii: (natoms,) intrinsic atomic radii
+        b_params: (natoms,) OBC b parameters
+        c_params: (natoms,) OBC c parameters
+        cutoff: cutoff distance
+
+    Returns:
+        born_radii: (natoms,) effective Born radii
+    """
+    if not CUDA_AVAILABLE:
+        raise RuntimeError("CUDA kernels not available")
+
+    coords = np.ascontiguousarray(coordinates, dtype=np.float64)
+    radii = np.ascontiguousarray(intrinsic_radii, dtype=np.float64)
+    b = np.ascontiguousarray(b_params, dtype=np.float64)
+    c = np.ascontiguousarray(c_params, dtype=np.float64)
+
+    return fennol_cuda.gb_compute_born_radii(coords, radii, b, c, cutoff)
+
+
+def gb_compute_energy_forces(
+    coordinates: np.ndarray,
+    charges: np.ndarray,
+    born_radii: np.ndarray,
+    dielectric: float,
+    cutoff: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute GB electrostatic energy and forces.
+
+    Args:
+        coordinates: (natoms, 3) atomic coordinates
+        charges: (natoms,) partial charges
+        born_radii: (natoms,) Born radii
+        dielectric: solvent dielectric constant
+        cutoff: cutoff distance
+
+    Returns:
+        Tuple of (energy, forces)
+    """
+    if not CUDA_AVAILABLE:
+        raise RuntimeError("CUDA kernels not available")
+
+    coords = np.ascontiguousarray(coordinates, dtype=np.float64)
+    q = np.ascontiguousarray(charges, dtype=np.float64)
+    radii = np.ascontiguousarray(born_radii, dtype=np.float64)
+
+    return fennol_cuda.gb_compute_energy_forces(coords, q, radii, dielectric, cutoff)
+
+
+def gb_compute_nonpolar(
+    coordinates: np.ndarray,
+    born_radii: np.ndarray,
+    gamma_params: np.ndarray,
+    probe_radius: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute non-polar (surface area) energy and forces.
+
+    Args:
+        coordinates: (natoms, 3) atomic coordinates
+        born_radii: (natoms,) Born radii
+        gamma_params: (natoms,) surface tension parameters
+        probe_radius: solvent probe radius
+
+    Returns:
+        Tuple of (energy, forces)
+    """
+    if not CUDA_AVAILABLE:
+        raise RuntimeError("CUDA kernels not available")
+
+    coords = np.ascontiguousarray(coordinates, dtype=np.float64)
+    radii = np.ascontiguousarray(born_radii, dtype=np.float64)
+    gamma = np.ascontiguousarray(gamma_params, dtype=np.float64)
+
+    return fennol_cuda.gb_compute_nonpolar(coords, radii, gamma, probe_radius)
 
 
 class CudaIntegrator:

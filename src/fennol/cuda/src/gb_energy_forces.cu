@@ -105,7 +105,7 @@ __global__ void compute_gb_pairwise_kernel(
     double E_pair = gb_factor * qi * qj / f_gb;
 
     // Accumulate energy (using atomic add to avoid race conditions)
-    atomicAdd(energy, E_pair);
+    atomicAddDouble(energy, E_pair);
 
     // Force magnitude: F = -dE/dr = gb_factor * q_i * q_j * df_GB/dr / f_GB²
     double force_mag = gb_factor * qi * qj * df_gb_dr / (f_gb * f_gb);
@@ -116,13 +116,13 @@ __global__ void compute_gb_pairwise_kernel(
     double fz = force_mag * dz / r;
 
     // Accumulate forces using atomic operations
-    atomicAdd(&forces[i * 3 + 0], fx);
-    atomicAdd(&forces[i * 3 + 1], fy);
-    atomicAdd(&forces[i * 3 + 2], fz);
+    atomicAddDouble(&forces[i * 3 + 0], fx);
+    atomicAddDouble(&forces[i * 3 + 1], fy);
+    atomicAddDouble(&forces[i * 3 + 2], fz);
 
-    atomicAdd(&forces[j * 3 + 0], -fx);
-    atomicAdd(&forces[j * 3 + 1], -fy);
-    atomicAdd(&forces[j * 3 + 2], -fz);
+    atomicAddDouble(&forces[j * 3 + 0], -fx);
+    atomicAddDouble(&forces[j * 3 + 1], -fy);
+    atomicAddDouble(&forces[j * 3 + 2], -fz);
 }
 
 /**
@@ -149,7 +149,7 @@ __global__ void compute_born_self_energy_kernel(
     double E_self = gb_factor * qi * qi / R_i;
 
     // Accumulate to total energy
-    atomicAdd(energy, E_self);
+    atomicAddDouble(energy, E_self);
 }
 
 /**
