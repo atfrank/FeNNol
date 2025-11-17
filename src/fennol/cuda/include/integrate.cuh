@@ -10,9 +10,8 @@ namespace cuda {
  * Velocity Verlet Integration - Step A (first half)
  * Updates positions and half-step velocities
  *
- * x_new = x + dt/2 * v
- * v_half = v + dt/2 * f/m
- * x_new = x_new + dt/2 * v_half
+ * v_half = v + (dt/2) * f/m
+ * x_new = x + dt * v_half
  *
  * @param coordinates [natoms, 3] - atomic coordinates (in/out)
  * @param velocities [natoms, 3] - atomic velocities (in/out)
@@ -34,7 +33,7 @@ void velocity_verlet_step_a(
  * Velocity Verlet Integration - Step B (second half)
  * Completes velocity update and calculates kinetic energy
  *
- * v_new = v_half + dt/2 * f/m
+ * v_new = v_half + (dt/2) * f/m
  *
  * @param velocities [natoms, 3] - atomic velocities (in/out)
  * @param forces [natoms, 3] - atomic forces

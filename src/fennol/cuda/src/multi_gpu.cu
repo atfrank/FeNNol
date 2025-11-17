@@ -38,7 +38,12 @@ bool enable_peer_access(int ngpus) {
     bool all_enabled = true;
 
     for (int i = 0; i < ngpus; ++i) {
-        cudaSetDevice(i);
+        cudaError_t set_err = cudaSetDevice(i);
+        if (set_err != cudaSuccess) {
+            all_enabled = false;
+            continue;
+        }
+
         for (int j = 0; j < ngpus; ++j) {
             if (i != j) {
                 if (check_peer_access(i, j)) {
@@ -101,12 +106,23 @@ MultiGPUContext* initialize_multi_gpu(
 
     // Create streams for each GPU
     for (int i = 0; i < ngpus; ++i) {
-        cudaSetDevice(i);
+        CUDA_CHECK_MULTI(cudaSetDevice(i), i);
         cudaStreamCreate(&ctx->streams[i]);
 
-        // Initialize domain
+        // Initialize domain with all pointers set to nullptr
         GPUDomain* domain = new GPUDomain();
         domain->gpu_id = i;
+        domain->natoms_local = 0;
+        domain->natoms_with_halo = 0;
+        domain->local_atom_indices = nullptr;
+        domain->halo_atom_indices = nullptr;
+        domain->d_coordinates = nullptr;
+        domain->d_velocities = nullptr;
+        domain->d_forces = nullptr;
+        domain->d_masses = nullptr;
+        domain->d_halo_coords = nullptr;
+        domain->d_send_buffer = nullptr;
+        domain->d_recv_buffer = nullptr;
         ctx->domains.push_back(domain);
     }
 
@@ -121,9 +137,12 @@ MultiGPUContext* initialize_multi_gpu(
 
 void cleanup_multi_gpu(MultiGPUContext* ctx) {
     for (int i = 0; i < ctx->ngpus; ++i) {
-        cudaSetDevice(i);
+        CUDA_CHECK_MULTI(cudaSetDevice(i), i);
 
         GPUDomain* domain = ctx->domains[i];
+
+        // Synchronize to ensure all kernels are complete before freeing memory
+        CUDA_CHECK_MULTI(cudaDeviceSynchronize(), i);
 
         // Free device memory
         if (domain->d_coordinates) cudaFree(domain->d_coordinates);
@@ -182,7 +201,12 @@ void distribute_atoms(
             double core_xmax = (gpu + 1) * domain_width;
 
             // Check if atom is in core domain (no halo)
-            if (x >= core_xmin && x < core_xmax) {
+            // Last GPU gets inclusive upper bound to handle x == box_x
+            bool in_domain = (gpu == ngpus - 1) ?
+                            (x >= core_xmin && x <= core_xmax) :
+                            (x >= core_xmin && x < core_xmax);
+
+            if (in_domain) {
                 local_indices.push_back(i);
             }
         }
@@ -194,7 +218,7 @@ void distribute_atoms(
         std::copy(local_indices.begin(), local_indices.end(), domain->local_atom_indices);
 
         // Allocate device memory
-        cudaSetDevice(gpu);
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         CUDA_CHECK_MULTI(cudaMalloc(&domain->d_coordinates, domain->natoms_local * 3 * sizeof(double)), gpu);
         CUDA_CHECK_MULTI(cudaMalloc(&domain->d_velocities, domain->natoms_local * 3 * sizeof(double)), gpu);
@@ -235,7 +259,7 @@ void exchange_halos(MultiGPUContext* ctx) {
 
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
-        cudaSetDevice(gpu);
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         // Copy halo data from neighboring domains
         // In real implementation, would identify atoms in halo regions
@@ -251,7 +275,7 @@ void exchange_halos(MultiGPUContext* ctx) {
 
     // Synchronize all GPUs
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
-        cudaSetDevice(gpu);
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
         cudaStreamSynchronize(ctx->streams[gpu]);
     }
 }
@@ -264,7 +288,7 @@ void multi_gpu_velocity_verlet_step_a(
     // Launch step A on all GPUs in parallel
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
-        cudaSetDevice(gpu);
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         // Pack forces for this domain
         std::vector<double> local_forces(domain->natoms_local * 3);
@@ -283,6 +307,7 @@ void multi_gpu_velocity_verlet_step_a(
                                     cudaMemcpyHostToDevice), gpu);
 
         // Execute step A on this GPU
+        // TODO: Pass stream to kernel for true async execution
         velocity_verlet_step_a(
             domain->d_coordinates,
             domain->d_velocities,
@@ -292,6 +317,8 @@ void multi_gpu_velocity_verlet_step_a(
             domain->natoms_local
         );
 
+        // CRITICAL: Synchronize before freeing memory
+        CUDA_CHECK_MULTI(cudaDeviceSynchronize(), gpu);
         cudaFree(d_forces_local);
     }
 
@@ -312,7 +339,7 @@ void multi_gpu_velocity_verlet_step_b(
     // Launch step B on all GPUs in parallel
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
-        cudaSetDevice(gpu);
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         // Pack forces
         std::vector<double> local_forces(domain->natoms_local * 3);
@@ -335,6 +362,7 @@ void multi_gpu_velocity_verlet_step_b(
         CUDA_CHECK_MULTI(cudaMalloc(&d_ke_tensor, 9 * sizeof(double)), gpu);
 
         // Execute step B
+        // TODO: Pass stream to kernel for true async execution
         velocity_verlet_step_b(
             domain->d_velocities,
             d_forces_local,
@@ -356,6 +384,8 @@ void multi_gpu_velocity_verlet_step_b(
             total_tensor[i] += local_tensor[i];
         }
 
+        // CRITICAL: Synchronize before freeing memory
+        CUDA_CHECK_MULTI(cudaDeviceSynchronize(), gpu);
         cudaFree(d_forces_local);
         cudaFree(d_ke);
         cudaFree(d_ke_tensor);
@@ -370,7 +400,7 @@ void multi_gpu_velocity_verlet_step_b(
 void gather_coordinates(MultiGPUContext* ctx, double* coordinates) {
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
-        cudaSetDevice(gpu);
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         // Copy from device
         std::vector<double> local_coords(domain->natoms_local * 3);
@@ -391,7 +421,7 @@ void gather_coordinates(MultiGPUContext* ctx, double* coordinates) {
 void gather_velocities(MultiGPUContext* ctx, double* velocities) {
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
-        cudaSetDevice(gpu);
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         std::vector<double> local_vels(domain->natoms_local * 3);
         CUDA_CHECK_MULTI(cudaMemcpy(local_vels.data(), domain->d_velocities,
@@ -410,7 +440,7 @@ void gather_velocities(MultiGPUContext* ctx, double* velocities) {
 void gather_forces(MultiGPUContext* ctx, double* forces) {
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
-        cudaSetDevice(gpu);
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         std::vector<double> local_forces(domain->natoms_local * 3);
         CUDA_CHECK_MULTI(cudaMemcpy(local_forces.data(), domain->d_forces,

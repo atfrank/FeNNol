@@ -2,16 +2,24 @@
 
 This document tracks known bugs and issues in the CUDA native implementation that require future attention.
 
-## Critical Bugs (Fixed in commit 1c9ad81)
+## Critical Bugs (Fixed in commits 1c9ad81, a3f29aa)
 
 The following critical bugs were discovered through comprehensive code review and have been **FIXED**:
 
-✅ **Integration kernels** - Division by zero with invalid masses
-✅ **Flat-bottom restraint** - Inverted force direction
-✅ **Backside attack restraint** - Wrong distance force sign
-✅ **Backside attack restraint** - Incorrect energy return method
-✅ **ZBL repulsion** - Wrong force derivative formula
-✅ **NLH repulsion** - Extra negative sign in force calculation
+✅ **Integration kernels** - Division by zero with invalid masses (commit 1c9ad81)
+✅ **Flat-bottom restraint** - Inverted force direction (commit 1c9ad81)
+✅ **Backside attack restraint** - Wrong distance force sign (commit 1c9ad81)
+✅ **Backside attack restraint** - Incorrect energy return method (commit 1c9ad81)
+✅ **ZBL repulsion** - Wrong force derivative formula (commit 1c9ad81)
+✅ **NLH repulsion** - Extra negative sign in force calculation (commit 1c9ad81)
+✅ **Python bindings** - Memory leaks on CUDA errors (RAII wrappers - current commit)
+✅ **Python bindings** - Missing input validation (comprehensive validation - current commit)
+✅ **Multi-GPU** - Memory freed before kernel completion (synchronization added - current commit)
+✅ **Multi-GPU** - Uninitialized pointers in GPUDomain (all pointers initialized - current commit)
+✅ **Multi-GPU** - Boundary atom assignment bug (inclusive upper bound - current commit)
+✅ **Multi-GPU** - Missing cudaSetDevice error checking (CUDA_CHECK_MULTI added - current commit)
+✅ **Documentation** - Incorrect Velocity Verlet description (integrate.cuh fixed - current commit)
+✅ **Code quality** - Dead code removed (get_device_ptr() removed - current commit)
 
 ---
 
@@ -21,20 +29,7 @@ The following critical bugs were discovered through comprehensive code review an
 
 **File:** `src/fennol/cuda/src/multi_gpu.cu`
 
-#### Issue #1: Memory Freed Before Kernel Completion
-**Lines:** 279-295, 327-361
-**Severity:** HIGH - Will cause crashes
-
-Device memory (`d_forces_local`, `d_ke`, `d_ke_tensor`) is freed immediately after kernel launch without synchronization, while kernels may still be running.
-
-**Fix Required:**
-```cuda
-cudaDeviceSynchronize();  // or cudaStreamSynchronize(ctx->streams[gpu])
-// Then free memory
-cudaFree(d_forces_local);
-```
-
-#### Issue #2: Kernels Not Using Streams
+#### Issue #1: Kernels Not Using Streams
 **Lines:** 286-293, 338-346
 **Severity:** HIGH - Breaks multi-GPU parallelism
 
@@ -42,7 +37,9 @@ Kernels are launched on the default stream, not the per-GPU streams, defeating t
 
 **Fix Required:** Pass stream parameter to integration functions or use stream-aware kernel launches.
 
-#### Issue #3: Sequential GPU Processing
+**Note:** This requires modifying the `velocity_verlet_step_a/b` function signatures in `integrate.cuh` to accept a `cudaStream_t` parameter, which is a more extensive refactoring.
+
+#### Issue #2: Sequential GPU Processing
 **Lines:** 313-362
 **Severity:** HIGH - Defeats parallelism
 
@@ -50,104 +47,13 @@ The loop processes each GPU sequentially with blocking memory copies instead of 
 
 **Fix Required:** Split into async launch phase and sync/gather phase.
 
-#### Issue #4: Halo Exchange Not Implemented
+#### Issue #3: Halo Exchange Not Implemented
 **Lines:** 232-257
 **Severity:** HIGH - Produces incorrect results
 
 The `exchange_halos()` function is a complete placeholder. Multi-GPU simulations will produce **wrong results** for atoms near domain boundaries.
 
 **Status:** Requires full implementation with proper halo communication.
-
-### 2. Python Bindings - Memory Safety
-
-**File:** `src/fennol/cuda/src/bindings.cpp`
-
-#### Issue #1: Memory Leaks on CUDA Errors
-**Lines:** All wrapper functions
-**Severity:** HIGH - Resource leaks
-
-If any `CUDA_CHECK` throws an exception after the first memory allocation, all previously allocated device memory is leaked because cleanup code is never reached.
-
-**Fix Required:** Implement RAII wrappers for CUDA memory:
-```cpp
-template<typename T>
-class CudaMemory {
-    T* ptr = nullptr;
-public:
-    CudaMemory(size_t count) {
-        CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(T)));
-    }
-    ~CudaMemory() { if (ptr) cudaFree(ptr); }
-    T* get() { return ptr; }
-};
-```
-
-#### Issue #2: Missing Input Validation
-**Lines:** All wrapper functions
-**Severity:** HIGH - Buffer overruns
-
-Array shapes are not validated:
-- No check that 2D arrays have correct second dimension
-- No consistency checks between array sizes
-- Missing validation of data types
-- No bounds checking on atom indices
-
-**Fix Required:** Add comprehensive validation helper:
-```cpp
-void validate_array_shape(const py::buffer_info& buf,
-                         const std::vector<ssize_t>& expected_shape,
-                         const std::string& name);
-```
-
----
-
-## Medium Priority Issues
-
-### 3. Multi-GPU Implementation Issues
-
-#### Issue #1: Uninitialized Pointers in GPUDomain
-**Line:** 108
-**Severity:** MEDIUM
-
-`new GPUDomain()` creates struct with uninitialized pointers (garbage values, not NULL). Cleanup code checks `if (domain->d_coordinates)` but this is undefined behavior.
-
-**Fix:** Initialize all pointers to `nullptr` or use constructor.
-
-#### Issue #2: Boundary Atom Assignment
-**Lines:** 185-186
-**Severity:** MEDIUM
-
-Atoms at `x == box_x` won't be assigned to any domain due to exclusive upper bound check.
-
-**Fix:** Special case for last GPU with inclusive upper bound.
-
-#### Issue #3: Missing cudaSetDevice Error Checking
-**Lines:** Multiple locations
-**Severity:** MEDIUM
-
-`cudaSetDevice()` can fail but errors aren't checked. Subsequent operations would execute on wrong GPU.
-
-**Fix:** Wrap all calls with `CUDA_CHECK_MULTI`.
-
-### 4. Code Quality Issues
-
-#### Issue #1: Misleading Documentation
-**File:** `src/fennol/cuda/include/integrate.cuh`
-**Lines:** 13-15
-**Severity:** LOW - Documentation only
-
-The header documentation describes the Velocity Verlet algorithm incorrectly (though the implementation is correct).
-
-**Status:** Documentation should be updated to match implementation.
-
-#### Issue #2: Dead Code
-**File:** `src/fennol/cuda/src/bindings.cpp`
-**Lines:** 14-18
-**Severity:** LOW
-
-`get_device_ptr()` helper function is never used and has a misleading name.
-
-**Fix:** Remove or rename.
 
 ---
 
@@ -195,9 +101,15 @@ Current implementation may be correct, but verification is recommended.
 
 ## Summary
 
-**Fixed:** 6 critical bugs (division by zero, force sign errors, derivative formulas)
-**High Priority:** 7 issues (multi-GPU sync, memory leaks, input validation)
-**Medium Priority:** 3 issues (uninitialized pointers, bounds checking)
-**Low Priority:** 2 issues (documentation, dead code)
+**Fixed:** 14 critical bugs and issues across all categories
+- 6 critical bugs in kernels (division by zero, force sign errors, derivative formulas) - commit 1c9ad81
+- 2 memory safety issues in Python bindings (RAII wrappers, input validation) - current commit
+- 4 multi-GPU bugs (initialization, synchronization, boundary assignment, error checking) - current commit
+- 2 documentation/code quality issues (misleading docs, dead code) - current commit
 
-**Recommendation:** Address high-priority multi-GPU and memory safety issues before using in production. The core kernels (integration, restraints, physics) are now correct after bug fixes.
+**Remaining High Priority:** 3 issues (all in multi-GPU)
+- Kernels not using streams (requires API refactoring)
+- Sequential GPU processing (requires async refactoring)
+- Halo exchange not implemented (requires full implementation)
+
+**Recommendation:** The core functionality (single-GPU integration, restraints, physics, Python bindings) is now production-ready. Multi-GPU support remains experimental and requires the remaining 3 issues to be addressed for production use.

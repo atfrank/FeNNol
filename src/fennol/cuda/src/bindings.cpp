@@ -1,5 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <vector>
+#include <sstream>
 #include "../include/integrate.cuh"
 #include "../include/restraints.cuh"
 #include "../include/physics.cuh"
@@ -10,11 +12,101 @@ namespace py = pybind11;
 namespace fennol {
 namespace cuda {
 
-// Helper function to get device pointer from numpy array
+// RAII wrapper for CUDA device memory
 template<typename T>
-T* get_device_ptr(py::array_t<T> arr) {
-    py::buffer_info buf = arr.request();
-    return static_cast<T*>(buf.ptr);
+class CudaMemory {
+    T* ptr = nullptr;
+    size_t count = 0;
+
+public:
+    CudaMemory(size_t n) : count(n) {
+        if (n > 0) {
+            CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(T)));
+        }
+    }
+
+    ~CudaMemory() {
+        if (ptr) {
+            cudaFree(ptr);  // Don't throw from destructor
+        }
+    }
+
+    // Delete copy operations
+    CudaMemory(const CudaMemory&) = delete;
+    CudaMemory& operator=(const CudaMemory&) = delete;
+
+    // Allow move operations
+    CudaMemory(CudaMemory&& other) noexcept : ptr(other.ptr), count(other.count) {
+        other.ptr = nullptr;
+        other.count = 0;
+    }
+
+    CudaMemory& operator=(CudaMemory&& other) noexcept {
+        if (this != &other) {
+            if (ptr) cudaFree(ptr);
+            ptr = other.ptr;
+            count = other.count;
+            other.ptr = nullptr;
+            other.count = 0;
+        }
+        return *this;
+    }
+
+    T* get() { return ptr; }
+    const T* get() const { return ptr; }
+    size_t size() const { return count; }
+
+    void memset(int value) {
+        if (ptr && count > 0) {
+            CUDA_CHECK(cudaMemset(ptr, value, count * sizeof(T)));
+        }
+    }
+
+    void copy_to_device(const void* host_ptr) {
+        if (ptr && host_ptr && count > 0) {
+            CUDA_CHECK(cudaMemcpy(ptr, host_ptr, count * sizeof(T), cudaMemcpyHostToDevice));
+        }
+    }
+
+    void copy_from_device(void* host_ptr) const {
+        if (ptr && host_ptr && count > 0) {
+            CUDA_CHECK(cudaMemcpy(host_ptr, ptr, count * sizeof(T), cudaMemcpyDeviceToHost));
+        }
+    }
+};
+
+// Input validation helpers
+inline void validate_array_ndim(const py::buffer_info& buf, int expected_ndim, const std::string& name) {
+    if (buf.ndim != expected_ndim) {
+        std::ostringstream oss;
+        oss << name << " must have " << expected_ndim << " dimensions, got " << buf.ndim;
+        throw std::runtime_error(oss.str());
+    }
+}
+
+inline void validate_array_shape_2d(const py::buffer_info& buf, ssize_t expected_dim1, const std::string& name) {
+    validate_array_ndim(buf, 2, name);
+    if (buf.shape[1] != expected_dim1) {
+        std::ostringstream oss;
+        oss << name << " must have shape (n, " << expected_dim1 << "), got (n, " << buf.shape[1] << ")";
+        throw std::runtime_error(oss.str());
+    }
+}
+
+inline void validate_array_size(const py::buffer_info& buf, ssize_t expected_size, const std::string& name) {
+    if (buf.shape[0] != expected_size) {
+        std::ostringstream oss;
+        oss << name << " must have " << expected_size << " elements, got " << buf.shape[0];
+        throw std::runtime_error(oss.str());
+    }
+}
+
+inline void validate_positive(int value, const std::string& name) {
+    if (value <= 0) {
+        std::ostringstream oss;
+        oss << name << " must be positive, got " << value;
+        throw std::runtime_error(oss.str());
+    }
 }
 
 // Wrapper functions for Python bindings
@@ -26,45 +118,43 @@ py::tuple py_velocity_verlet_step_a(
     py::array_t<double> masses,
     double dt
 ) {
+    // Validate inputs
     auto coords_buf = coordinates.request();
     auto vel_buf = velocities.request();
     auto forces_buf = forces.request();
     auto masses_buf = masses.request();
 
-    if (coords_buf.ndim != 2 || coords_buf.shape[1] != 3) {
-        throw std::runtime_error("coordinates must be (natoms, 3)");
-    }
-    if (vel_buf.ndim != 2 || vel_buf.shape[1] != 3) {
-        throw std::runtime_error("velocities must be (natoms, 3)");
-    }
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+    validate_array_shape_2d(vel_buf, 3, "velocities");
+    validate_array_shape_2d(forces_buf, 3, "forces");
+    validate_array_ndim(masses_buf, 1, "masses");
 
     int natoms = coords_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_array_size(vel_buf, natoms, "velocities");
+    validate_array_size(forces_buf, natoms, "forces");
+    validate_array_size(masses_buf, natoms, "masses");
 
-    // Allocate device memory and copy data
-    double *d_coords, *d_vels, *d_forces, *d_masses;
-    CUDA_CHECK(cudaMalloc(&d_coords, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_vels, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_forces, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_masses, natoms * sizeof(double)));
+    // Allocate device memory using RAII
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<double> d_vels(natoms * 3);
+    CudaMemory<double> d_forces(natoms * 3);
+    CudaMemory<double> d_masses(natoms);
 
-    CUDA_CHECK(cudaMemcpy(d_coords, coords_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_vels, vel_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_forces, forces_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_masses, masses_buf.ptr, natoms * sizeof(double), cudaMemcpyHostToDevice));
+    // Copy to device
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_vels.copy_to_device(vel_buf.ptr);
+    d_forces.copy_to_device(forces_buf.ptr);
+    d_masses.copy_to_device(masses_buf.ptr);
 
     // Execute kernel
-    velocity_verlet_step_a(d_coords, d_vels, d_forces, d_masses, dt, natoms);
+    velocity_verlet_step_a(d_coords.get(), d_vels.get(), d_forces.get(), d_masses.get(), dt, natoms);
 
     // Copy results back
-    CUDA_CHECK(cudaMemcpy(coords_buf.ptr, d_coords, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(vel_buf.ptr, d_vels, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    d_coords.copy_from_device(coords_buf.ptr);
+    d_vels.copy_from_device(vel_buf.ptr);
 
-    // Free device memory
-    CUDA_CHECK(cudaFree(d_coords));
-    CUDA_CHECK(cudaFree(d_vels));
-    CUDA_CHECK(cudaFree(d_forces));
-    CUDA_CHECK(cudaFree(d_masses));
-
+    // RAII automatically frees memory
     return py::make_tuple(coordinates, velocities);
 }
 
@@ -74,48 +164,50 @@ py::tuple py_velocity_verlet_step_b(
     py::array_t<double> masses,
     double dt
 ) {
+    // Validate inputs
     auto vel_buf = velocities.request();
     auto forces_buf = forces.request();
     auto masses_buf = masses.request();
 
-    int natoms = vel_buf.shape[0];
+    validate_array_shape_2d(vel_buf, 3, "velocities");
+    validate_array_shape_2d(forces_buf, 3, "forces");
+    validate_array_ndim(masses_buf, 1, "masses");
 
-    // Allocate device memory
-    double *d_vels, *d_forces, *d_masses, *d_ke, *d_ke_tensor;
-    CUDA_CHECK(cudaMalloc(&d_vels, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_forces, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_masses, natoms * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_ke, sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_ke_tensor, 9 * sizeof(double)));
+    int natoms = vel_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_array_size(forces_buf, natoms, "forces");
+    validate_array_size(masses_buf, natoms, "masses");
+
+    // Allocate device memory using RAII
+    CudaMemory<double> d_vels(natoms * 3);
+    CudaMemory<double> d_forces(natoms * 3);
+    CudaMemory<double> d_masses(natoms);
+    CudaMemory<double> d_ke(1);
+    CudaMemory<double> d_ke_tensor(9);
 
     // Copy to device
-    CUDA_CHECK(cudaMemcpy(d_vels, vel_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_forces, forces_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_masses, masses_buf.ptr, natoms * sizeof(double), cudaMemcpyHostToDevice));
+    d_vels.copy_to_device(vel_buf.ptr);
+    d_forces.copy_to_device(forces_buf.ptr);
+    d_masses.copy_to_device(masses_buf.ptr);
 
     // Execute kernel
-    velocity_verlet_step_b(d_vels, d_forces, d_masses, dt, natoms, d_ke, d_ke_tensor);
+    velocity_verlet_step_b(d_vels.get(), d_forces.get(), d_masses.get(), dt, natoms,
+                          d_ke.get(), d_ke_tensor.get());
 
     // Copy results back
-    CUDA_CHECK(cudaMemcpy(vel_buf.ptr, d_vels, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    d_vels.copy_from_device(vel_buf.ptr);
 
     double kinetic_energy;
     auto ke_tensor = py::array_t<double>(9);
     auto ke_tensor_buf = ke_tensor.request();
 
-    CUDA_CHECK(cudaMemcpy(&kinetic_energy, d_ke, sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(ke_tensor_buf.ptr, d_ke_tensor, 9 * sizeof(double), cudaMemcpyDeviceToHost));
+    d_ke.copy_from_device(&kinetic_energy);
+    d_ke_tensor.copy_from_device(ke_tensor_buf.ptr);
 
     // Reshape tensor to 3x3
     ke_tensor.resize({3, 3});
 
-    // Free device memory
-    CUDA_CHECK(cudaFree(d_vels));
-    CUDA_CHECK(cudaFree(d_forces));
-    CUDA_CHECK(cudaFree(d_masses));
-    CUDA_CHECK(cudaFree(d_ke));
-    CUDA_CHECK(cudaFree(d_ke_tensor));
-
+    // RAII automatically frees memory
     return py::make_tuple(velocities, kinetic_energy, ke_tensor);
 }
 
@@ -125,54 +217,54 @@ py::tuple py_harmonic_distance_restraint(
     py::array_t<double> target_distances,
     py::array_t<double> force_constants
 ) {
+    // Validate inputs
     auto coords_buf = coordinates.request();
     auto indices_buf = atom_indices.request();
     auto targets_buf = target_distances.request();
     auto fcs_buf = force_constants.request();
 
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+    validate_array_shape_2d(indices_buf, 2, "atom_indices");
+    validate_array_ndim(targets_buf, 1, "target_distances");
+    validate_array_ndim(fcs_buf, 1, "force_constants");
+
     int natoms = coords_buf.shape[0];
     int nrestraints = indices_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_positive(nrestraints, "nrestraints");
+    validate_array_size(targets_buf, nrestraints, "target_distances");
+    validate_array_size(fcs_buf, nrestraints, "force_constants");
 
-    // Allocate device memory
-    double *d_coords, *d_targets, *d_fcs, *d_energy, *d_forces;
-    int *d_indices;
-
-    CUDA_CHECK(cudaMalloc(&d_coords, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_indices, nrestraints * 2 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_targets, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_fcs, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_energy, sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_forces, natoms * 3 * sizeof(double)));
+    // Allocate device memory using RAII
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<int> d_indices(nrestraints * 2);
+    CudaMemory<double> d_targets(nrestraints);
+    CudaMemory<double> d_fcs(nrestraints);
+    CudaMemory<double> d_energy(1);
+    CudaMemory<double> d_forces(natoms * 3);
 
     // Initialize forces to zero
-    CUDA_CHECK(cudaMemset(d_forces, 0, natoms * 3 * sizeof(double)));
+    d_forces.memset(0);
 
     // Copy to device
-    CUDA_CHECK(cudaMemcpy(d_coords, coords_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_indices, indices_buf.ptr, nrestraints * 2 * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_targets, targets_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_fcs, fcs_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_indices.copy_to_device(indices_buf.ptr);
+    d_targets.copy_to_device(targets_buf.ptr);
+    d_fcs.copy_to_device(fcs_buf.ptr);
 
     // Execute kernel
-    harmonic_distance_restraint(d_coords, d_indices, d_targets, d_fcs,
-                                natoms, nrestraints, d_energy, d_forces);
+    harmonic_distance_restraint(d_coords.get(), d_indices.get(), d_targets.get(), d_fcs.get(),
+                                natoms, nrestraints, d_energy.get(), d_forces.get());
 
     // Copy results back
     double energy;
     auto forces = py::array_t<double>({natoms, 3});
     auto forces_buf = forces.request();
 
-    CUDA_CHECK(cudaMemcpy(&energy, d_energy, sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(forces_buf.ptr, d_forces, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    d_energy.copy_from_device(&energy);
+    d_forces.copy_from_device(forces_buf.ptr);
 
-    // Free device memory
-    CUDA_CHECK(cudaFree(d_coords));
-    CUDA_CHECK(cudaFree(d_indices));
-    CUDA_CHECK(cudaFree(d_targets));
-    CUDA_CHECK(cudaFree(d_fcs));
-    CUDA_CHECK(cudaFree(d_energy));
-    CUDA_CHECK(cudaFree(d_forces));
-
+    // RAII automatically frees memory
     return py::make_tuple(energy, forces);
 }
 
@@ -183,48 +275,54 @@ py::tuple py_harmonic_angle_restraint(
     py::array_t<double> target_angles,
     py::array_t<double> force_constants
 ) {
+    // Validate inputs
     auto coords_buf = coordinates.request();
     auto indices_buf = atom_indices.request();
     auto targets_buf = target_angles.request();
     auto fcs_buf = force_constants.request();
 
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+    validate_array_shape_2d(indices_buf, 3, "atom_indices");
+    validate_array_ndim(targets_buf, 1, "target_angles");
+    validate_array_ndim(fcs_buf, 1, "force_constants");
+
     int natoms = coords_buf.shape[0];
     int nrestraints = indices_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_positive(nrestraints, "nrestraints");
+    validate_array_size(targets_buf, nrestraints, "target_angles");
+    validate_array_size(fcs_buf, nrestraints, "force_constants");
 
-    double *d_coords, *d_targets, *d_fcs, *d_energy, *d_forces;
-    int *d_indices;
+    // Allocate device memory using RAII
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<int> d_indices(nrestraints * 3);
+    CudaMemory<double> d_targets(nrestraints);
+    CudaMemory<double> d_fcs(nrestraints);
+    CudaMemory<double> d_energy(1);
+    CudaMemory<double> d_forces(natoms * 3);
 
-    CUDA_CHECK(cudaMalloc(&d_coords, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_indices, nrestraints * 3 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_targets, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_fcs, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_energy, sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_forces, natoms * 3 * sizeof(double)));
+    // Initialize forces to zero
+    d_forces.memset(0);
 
-    CUDA_CHECK(cudaMemset(d_forces, 0, natoms * 3 * sizeof(double)));
+    // Copy to device
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_indices.copy_to_device(indices_buf.ptr);
+    d_targets.copy_to_device(targets_buf.ptr);
+    d_fcs.copy_to_device(fcs_buf.ptr);
 
-    CUDA_CHECK(cudaMemcpy(d_coords, coords_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_indices, indices_buf.ptr, nrestraints * 3 * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_targets, targets_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_fcs, fcs_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
+    // Execute kernel
+    harmonic_angle_restraint(d_coords.get(), d_indices.get(), d_targets.get(), d_fcs.get(),
+                            natoms, nrestraints, d_energy.get(), d_forces.get());
 
-    harmonic_angle_restraint(d_coords, d_indices, d_targets, d_fcs,
-                            natoms, nrestraints, d_energy, d_forces);
-
+    // Copy results back
     double energy;
     auto forces = py::array_t<double>({natoms, 3});
     auto forces_buf = forces.request();
 
-    CUDA_CHECK(cudaMemcpy(&energy, d_energy, sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(forces_buf.ptr, d_forces, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    d_energy.copy_from_device(&energy);
+    d_forces.copy_from_device(forces_buf.ptr);
 
-    CUDA_CHECK(cudaFree(d_coords));
-    CUDA_CHECK(cudaFree(d_indices));
-    CUDA_CHECK(cudaFree(d_targets));
-    CUDA_CHECK(cudaFree(d_fcs));
-    CUDA_CHECK(cudaFree(d_energy));
-    CUDA_CHECK(cudaFree(d_forces));
-
+    // RAII automatically frees memory
     return py::make_tuple(energy, forces);
 }
 
@@ -235,52 +333,59 @@ py::tuple py_flat_bottom_distance_restraint(
     py::array_t<double> force_constants,
     py::array_t<double> tolerances
 ) {
+    // Validate inputs
     auto coords_buf = coordinates.request();
     auto indices_buf = atom_indices.request();
     auto targets_buf = target_distances.request();
     auto fcs_buf = force_constants.request();
     auto tols_buf = tolerances.request();
 
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+    validate_array_shape_2d(indices_buf, 2, "atom_indices");
+    validate_array_ndim(targets_buf, 1, "target_distances");
+    validate_array_ndim(fcs_buf, 1, "force_constants");
+    validate_array_ndim(tols_buf, 1, "tolerances");
+
     int natoms = coords_buf.shape[0];
     int nrestraints = indices_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_positive(nrestraints, "nrestraints");
+    validate_array_size(targets_buf, nrestraints, "target_distances");
+    validate_array_size(fcs_buf, nrestraints, "force_constants");
+    validate_array_size(tols_buf, nrestraints, "tolerances");
 
-    double *d_coords, *d_targets, *d_fcs, *d_tols, *d_energy, *d_forces;
-    int *d_indices;
+    // Allocate device memory using RAII
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<int> d_indices(nrestraints * 2);
+    CudaMemory<double> d_targets(nrestraints);
+    CudaMemory<double> d_fcs(nrestraints);
+    CudaMemory<double> d_tols(nrestraints);
+    CudaMemory<double> d_energy(1);
+    CudaMemory<double> d_forces(natoms * 3);
 
-    CUDA_CHECK(cudaMalloc(&d_coords, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_indices, nrestraints * 2 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_targets, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_fcs, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_tols, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_energy, sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_forces, natoms * 3 * sizeof(double)));
+    // Initialize forces to zero
+    d_forces.memset(0);
 
-    CUDA_CHECK(cudaMemset(d_forces, 0, natoms * 3 * sizeof(double)));
+    // Copy to device
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_indices.copy_to_device(indices_buf.ptr);
+    d_targets.copy_to_device(targets_buf.ptr);
+    d_fcs.copy_to_device(fcs_buf.ptr);
+    d_tols.copy_to_device(tols_buf.ptr);
 
-    CUDA_CHECK(cudaMemcpy(d_coords, coords_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_indices, indices_buf.ptr, nrestraints * 2 * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_targets, targets_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_fcs, fcs_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tols, tols_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
+    // Execute kernel
+    flat_bottom_distance_restraint(d_coords.get(), d_indices.get(), d_targets.get(), d_fcs.get(), d_tols.get(),
+                                    natoms, nrestraints, d_energy.get(), d_forces.get());
 
-    flat_bottom_distance_restraint(d_coords, d_indices, d_targets, d_fcs, d_tols,
-                                    natoms, nrestraints, d_energy, d_forces);
-
+    // Copy results back
     double energy;
     auto forces = py::array_t<double>({natoms, 3});
     auto forces_buf = forces.request();
 
-    CUDA_CHECK(cudaMemcpy(&energy, d_energy, sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(forces_buf.ptr, d_forces, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    d_energy.copy_from_device(&energy);
+    d_forces.copy_from_device(forces_buf.ptr);
 
-    CUDA_CHECK(cudaFree(d_coords));
-    CUDA_CHECK(cudaFree(d_indices));
-    CUDA_CHECK(cudaFree(d_targets));
-    CUDA_CHECK(cudaFree(d_fcs));
-    CUDA_CHECK(cudaFree(d_tols));
-    CUDA_CHECK(cudaFree(d_energy));
-    CUDA_CHECK(cudaFree(d_forces));
-
+    // RAII automatically frees memory
     return py::make_tuple(energy, forces);
 }
 
@@ -291,47 +396,54 @@ py::tuple py_nlh_repulsion(
     py::array_t<double> pair_coefficients,
     double cutoff
 ) {
+    // Validate inputs
     auto coords_buf = coordinates.request();
     auto Z_buf = atomic_numbers.request();
     auto pairs_buf = atom_pairs.request();
     auto coeffs_buf = pair_coefficients.request();
 
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+    validate_array_ndim(Z_buf, 1, "atomic_numbers");
+    validate_array_shape_2d(pairs_buf, 2, "atom_pairs");
+    validate_array_shape_2d(coeffs_buf, 6, "pair_coefficients");
+
     int natoms = coords_buf.shape[0];
     int npairs = pairs_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_positive(npairs, "npairs");
+    validate_array_size(Z_buf, natoms, "atomic_numbers");
+    validate_array_size(coeffs_buf, npairs, "pair_coefficients");
 
-    double *d_coords, *d_coeffs, *d_energy, *d_forces;
-    int *d_Z, *d_pairs;
+    // Allocate device memory using RAII
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<int> d_Z(natoms);
+    CudaMemory<int> d_pairs(npairs * 2);
+    CudaMemory<double> d_coeffs(npairs * 6);
+    CudaMemory<double> d_energy(1);
+    CudaMemory<double> d_forces(natoms * 3);
 
-    CUDA_CHECK(cudaMalloc(&d_coords, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_Z, natoms * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_pairs, npairs * 2 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_coeffs, npairs * 6 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_energy, sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_forces, natoms * 3 * sizeof(double)));
+    // Initialize forces to zero
+    d_forces.memset(0);
 
-    CUDA_CHECK(cudaMemset(d_forces, 0, natoms * 3 * sizeof(double)));
+    // Copy to device
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_Z.copy_to_device(Z_buf.ptr);
+    d_pairs.copy_to_device(pairs_buf.ptr);
+    d_coeffs.copy_to_device(coeffs_buf.ptr);
 
-    CUDA_CHECK(cudaMemcpy(d_coords, coords_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_Z, Z_buf.ptr, natoms * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_pairs, pairs_buf.ptr, npairs * 2 * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_coeffs, coeffs_buf.ptr, npairs * 6 * sizeof(double), cudaMemcpyHostToDevice));
+    // Execute kernel
+    nlh_repulsion(d_coords.get(), d_Z.get(), d_pairs.get(), d_coeffs.get(), natoms, npairs, cutoff,
+                  d_energy.get(), d_forces.get());
 
-    nlh_repulsion(d_coords, d_Z, d_pairs, d_coeffs, natoms, npairs, cutoff, d_energy, d_forces);
-
+    // Copy results back
     double energy;
     auto forces = py::array_t<double>({natoms, 3});
     auto forces_buf = forces.request();
 
-    CUDA_CHECK(cudaMemcpy(&energy, d_energy, sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(forces_buf.ptr, d_forces, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    d_energy.copy_from_device(&energy);
+    d_forces.copy_from_device(forces_buf.ptr);
 
-    CUDA_CHECK(cudaFree(d_coords));
-    CUDA_CHECK(cudaFree(d_Z));
-    CUDA_CHECK(cudaFree(d_pairs));
-    CUDA_CHECK(cudaFree(d_coeffs));
-    CUDA_CHECK(cudaFree(d_energy));
-    CUDA_CHECK(cudaFree(d_forces));
-
+    // RAII automatically frees memory
     return py::make_tuple(energy, forces);
 }
 
@@ -342,26 +454,33 @@ py::tuple py_berendsen_thermostat(
     double coupling_time,
     double dt
 ) {
+    // Validate inputs
     auto vel_buf = velocities.request();
     auto masses_buf = masses.request();
 
+    validate_array_shape_2d(vel_buf, 3, "velocities");
+    validate_array_ndim(masses_buf, 1, "masses");
+
     int natoms = vel_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_array_size(masses_buf, natoms, "masses");
 
-    double *d_vels, *d_masses;
-    CUDA_CHECK(cudaMalloc(&d_vels, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_masses, natoms * sizeof(double)));
+    // Allocate device memory using RAII
+    CudaMemory<double> d_vels(natoms * 3);
+    CudaMemory<double> d_masses(natoms);
 
-    CUDA_CHECK(cudaMemcpy(d_vels, vel_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_masses, masses_buf.ptr, natoms * sizeof(double), cudaMemcpyHostToDevice));
+    // Copy to device
+    d_vels.copy_to_device(vel_buf.ptr);
+    d_masses.copy_to_device(masses_buf.ptr);
 
+    // Execute kernel
     double current_temp;
-    berendsen_thermostat(d_vels, d_masses, natoms, target_temperature, coupling_time, dt, &current_temp);
+    berendsen_thermostat(d_vels.get(), d_masses.get(), natoms, target_temperature, coupling_time, dt, &current_temp);
 
-    CUDA_CHECK(cudaMemcpy(vel_buf.ptr, d_vels, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    // Copy results back
+    d_vels.copy_from_device(vel_buf.ptr);
 
-    CUDA_CHECK(cudaFree(d_vels));
-    CUDA_CHECK(cudaFree(d_masses));
-
+    // RAII automatically frees memory
     return py::make_tuple(velocities, current_temp);
 }
 
@@ -370,26 +489,33 @@ py::tuple py_velocity_rescale_thermostat(
     py::array_t<double> masses,
     double target_temperature
 ) {
+    // Validate inputs
     auto vel_buf = velocities.request();
     auto masses_buf = masses.request();
 
+    validate_array_shape_2d(vel_buf, 3, "velocities");
+    validate_array_ndim(masses_buf, 1, "masses");
+
     int natoms = vel_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_array_size(masses_buf, natoms, "masses");
 
-    double *d_vels, *d_masses;
-    CUDA_CHECK(cudaMalloc(&d_vels, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_masses, natoms * sizeof(double)));
+    // Allocate device memory using RAII
+    CudaMemory<double> d_vels(natoms * 3);
+    CudaMemory<double> d_masses(natoms);
 
-    CUDA_CHECK(cudaMemcpy(d_vels, vel_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_masses, masses_buf.ptr, natoms * sizeof(double), cudaMemcpyHostToDevice));
+    // Copy to device
+    d_vels.copy_to_device(vel_buf.ptr);
+    d_masses.copy_to_device(masses_buf.ptr);
 
+    // Execute kernel
     double current_temp;
-    velocity_rescale_thermostat(d_vels, d_masses, natoms, target_temperature, &current_temp);
+    velocity_rescale_thermostat(d_vels.get(), d_masses.get(), natoms, target_temperature, &current_temp);
 
-    CUDA_CHECK(cudaMemcpy(vel_buf.ptr, d_vels, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    // Copy results back
+    d_vels.copy_from_device(vel_buf.ptr);
 
-    CUDA_CHECK(cudaFree(d_vels));
-    CUDA_CHECK(cudaFree(d_masses));
-
+    // RAII automatically frees memory
     return py::make_tuple(velocities, current_temp);
 }
 
@@ -401,6 +527,7 @@ py::tuple py_backside_attack_restraint(
     py::array_t<double> target_distances,
     py::array_t<double> distance_force_constants
 ) {
+    // Validate inputs
     auto coords_buf = coordinates.request();
     auto indices_buf = restraint_indices.request();
     auto angles_buf = target_angles.request();
@@ -408,49 +535,57 @@ py::tuple py_backside_attack_restraint(
     auto dists_buf = target_distances.request();
     auto dist_fcs_buf = distance_force_constants.request();
 
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+    validate_array_shape_2d(indices_buf, 3, "restraint_indices");
+    validate_array_ndim(angles_buf, 1, "target_angles");
+    validate_array_ndim(angle_fcs_buf, 1, "angle_force_constants");
+    validate_array_ndim(dists_buf, 1, "target_distances");
+    validate_array_ndim(dist_fcs_buf, 1, "distance_force_constants");
+
     int natoms = coords_buf.shape[0];
     int nrestraints = indices_buf.shape[0];
+    validate_positive(natoms, "natoms");
+    validate_positive(nrestraints, "nrestraints");
+    validate_array_size(angles_buf, nrestraints, "target_angles");
+    validate_array_size(angle_fcs_buf, nrestraints, "angle_force_constants");
+    validate_array_size(dists_buf, nrestraints, "target_distances");
+    validate_array_size(dist_fcs_buf, nrestraints, "distance_force_constants");
 
-    double *d_coords, *d_angles, *d_angle_fcs, *d_dists, *d_dist_fcs, *d_energy, *d_forces;
-    int *d_indices;
+    // Allocate device memory using RAII
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<int> d_indices(nrestraints * 3);
+    CudaMemory<double> d_angles(nrestraints);
+    CudaMemory<double> d_angle_fcs(nrestraints);
+    CudaMemory<double> d_dists(nrestraints);
+    CudaMemory<double> d_dist_fcs(nrestraints);
+    CudaMemory<double> d_energy(1);
+    CudaMemory<double> d_forces(natoms * 3);
 
-    CUDA_CHECK(cudaMalloc(&d_coords, natoms * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_indices, nrestraints * 3 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_angles, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_angle_fcs, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dists, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dist_fcs, nrestraints * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_energy, sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_forces, natoms * 3 * sizeof(double)));
+    // Initialize forces to zero
+    d_forces.memset(0);
 
-    CUDA_CHECK(cudaMemset(d_forces, 0, natoms * 3 * sizeof(double)));
+    // Copy to device
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_indices.copy_to_device(indices_buf.ptr);
+    d_angles.copy_to_device(angles_buf.ptr);
+    d_angle_fcs.copy_to_device(angle_fcs_buf.ptr);
+    d_dists.copy_to_device(dists_buf.ptr);
+    d_dist_fcs.copy_to_device(dist_fcs_buf.ptr);
 
-    CUDA_CHECK(cudaMemcpy(d_coords, coords_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_indices, indices_buf.ptr, nrestraints * 3 * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_angles, angles_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_angle_fcs, angle_fcs_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_dists, dists_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_dist_fcs, dist_fcs_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
+    // Execute kernel
+    backside_attack_restraint(d_coords.get(), d_indices.get(), d_angles.get(), d_angle_fcs.get(),
+                              d_dists.get(), d_dist_fcs.get(), natoms, nrestraints,
+                              d_energy.get(), d_forces.get());
 
-    backside_attack_restraint(d_coords, d_indices, d_angles, d_angle_fcs, d_dists, d_dist_fcs,
-                              natoms, nrestraints, d_energy, d_forces);
-
+    // Copy results back
     double energy;
     auto forces = py::array_t<double>({natoms, 3});
     auto forces_buf = forces.request();
 
-    CUDA_CHECK(cudaMemcpy(&energy, d_energy, sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(forces_buf.ptr, d_forces, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+    d_energy.copy_from_device(&energy);
+    d_forces.copy_from_device(forces_buf.ptr);
 
-    CUDA_CHECK(cudaFree(d_coords));
-    CUDA_CHECK(cudaFree(d_indices));
-    CUDA_CHECK(cudaFree(d_angles));
-    CUDA_CHECK(cudaFree(d_angle_fcs));
-    CUDA_CHECK(cudaFree(d_dists));
-    CUDA_CHECK(cudaFree(d_dist_fcs));
-    CUDA_CHECK(cudaFree(d_energy));
-    CUDA_CHECK(cudaFree(d_forces));
-
+    // RAII automatically frees memory
     return py::make_tuple(energy, forces);
 }
 
