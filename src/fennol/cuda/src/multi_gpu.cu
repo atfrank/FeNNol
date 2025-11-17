@@ -114,6 +114,7 @@ MultiGPUContext* initialize_multi_gpu(
         domain->gpu_id = i;
         domain->natoms_local = 0;
         domain->natoms_with_halo = 0;
+        domain->max_halo_capacity = 0;
         domain->local_atom_indices = nullptr;
         domain->halo_atom_indices = nullptr;
         domain->d_coordinates = nullptr;
@@ -121,8 +122,6 @@ MultiGPUContext* initialize_multi_gpu(
         domain->d_forces = nullptr;
         domain->d_masses = nullptr;
         domain->d_halo_coords = nullptr;
-        domain->d_send_buffer = nullptr;
-        domain->d_recv_buffer = nullptr;
         ctx->domains.push_back(domain);
     }
 
@@ -144,14 +143,22 @@ void cleanup_multi_gpu(MultiGPUContext* ctx) {
         // Synchronize to ensure all kernels are complete before freeing memory
         CUDA_CHECK_MULTI(cudaDeviceSynchronize(), i);
 
-        // Free device memory
-        if (domain->d_coordinates) cudaFree(domain->d_coordinates);
-        if (domain->d_velocities) cudaFree(domain->d_velocities);
-        if (domain->d_forces) cudaFree(domain->d_forces);
-        if (domain->d_masses) cudaFree(domain->d_masses);
-        if (domain->d_halo_coords) cudaFree(domain->d_halo_coords);
-        if (domain->d_send_buffer) cudaFree(domain->d_send_buffer);
-        if (domain->d_recv_buffer) cudaFree(domain->d_recv_buffer);
+        // Free device memory with error checking
+        auto safe_free = [i](void* ptr, const char* name) {
+            if (ptr) {
+                cudaError_t err = cudaFree(ptr);
+                if (err != cudaSuccess) {
+                    std::cerr << "Warning: GPU " << i << " failed to free "
+                              << name << ": " << cudaGetErrorString(err) << "\n";
+                }
+            }
+        };
+
+        safe_free(domain->d_coordinates, "coordinates");
+        safe_free(domain->d_velocities, "velocities");
+        safe_free(domain->d_forces, "forces");
+        safe_free(domain->d_masses, "masses");
+        safe_free(domain->d_halo_coords, "halo_coords");
 
         // Free host memory
         if (domain->local_atom_indices) delete[] domain->local_atom_indices;
@@ -275,14 +282,20 @@ void distribute_atoms(
         double density = natoms / box_volume;
         // Halo region volume: 2 * cutoff * box_y * box_z (left and right boundaries)
         double halo_volume = 2.0 * ctx->cutoff * box_size[1] * box_size[2];
-        int max_halo_atoms = static_cast<int>(density * halo_volume * 1.5);  // 1.5x safety factor
-        max_halo_atoms = std::max(max_halo_atoms, 100);  // Minimum buffer size
 
-        // Allocate halo buffers on device
-        // Each neighbor can send up to max_halo_atoms/2
-        int buffer_size = max_halo_atoms / 2;
-        CUDA_CHECK_MULTI(cudaMalloc(&domain->d_send_buffer, buffer_size * 3 * sizeof(double)), gpu);
-        CUDA_CHECK_MULTI(cudaMalloc(&domain->d_recv_buffer, buffer_size * 3 * sizeof(double)), gpu);
+        // Use 2.5x safety factor for non-uniform distributions (e.g., protein clusters)
+        // Use ceil to avoid truncation errors
+        int max_halo_atoms = static_cast<int>(std::ceil(density * halo_volume * 2.5));
+
+        // More reasonable minimum based on cutoff volume
+        int min_buffer = static_cast<int>(std::ceil(density * ctx->cutoff * box_size[1] * box_size[2] * 2.0));
+        min_buffer = std::max(min_buffer, 200);  // Absolute minimum
+        max_halo_atoms = std::max(max_halo_atoms, min_buffer);
+
+        // Store max capacity in domain for bounds checking
+        domain->max_halo_capacity = max_halo_atoms;
+
+        // Allocate halo buffer on device (send/recv buffers not needed with host staging)
         CUDA_CHECK_MULTI(cudaMalloc(&domain->d_halo_coords, max_halo_atoms * 3 * sizeof(double)), gpu);
 
         // Initialize send/recv counts for each neighbor
@@ -337,7 +350,9 @@ void exchange_halos(MultiGPUContext* ctx) {
         if (gpu < ngpus - 1) {
             for (int i = 0; i < domain->natoms_local; ++i) {
                 double x = coords[i * 3 + 0];
-                if (x > xmax - cutoff && x <= xmax) {
+                // Fixed: Use >= to include atoms at exact cutoff boundary
+                // Fixed: Use < instead of <= (xmax is not owned by this GPU)
+                if (x >= xmax - cutoff && x < xmax) {
                     // Atom is in right boundary region
                     right_boundary_atoms[gpu].push_back(coords[i * 3 + 0]);
                     right_boundary_atoms[gpu].push_back(coords[i * 3 + 1]);
@@ -370,10 +385,21 @@ void exchange_halos(MultiGPUContext* ctx) {
         }
 
         // Update halo atom count
-        domain->natoms_with_halo = domain->natoms_local + (halo_atoms.size() / 3);
+        int halo_atom_count = halo_atoms.size() / 3;
+        domain->natoms_with_halo = domain->natoms_local + halo_atom_count;
 
-        // Copy halo atoms to device
-        if (!halo_atoms.empty()) {
+        // Copy halo atoms to device with bounds checking
+        if (halo_atom_count > 0) {
+            // CRITICAL: Check buffer overflow before copy
+            if (halo_atom_count > domain->max_halo_capacity) {
+                throw std::runtime_error(
+                    std::string("GPU ") + std::to_string(gpu) +
+                    ": Halo buffer overflow! Need " + std::to_string(halo_atom_count) +
+                    " atoms but allocated " + std::to_string(domain->max_halo_capacity) +
+                    ". Increase safety factor or box size."
+                );
+            }
+
             CUDA_CHECK_MULTI(cudaMemcpy(domain->d_halo_coords, halo_atoms.data(),
                                         halo_atoms.size() * sizeof(double),
                                         cudaMemcpyHostToDevice), gpu);
@@ -413,26 +439,34 @@ void multi_gpu_velocity_verlet_step_a(
     const double* forces,
     double dt
 ) {
-    // Store temporary device pointers for cleanup
+    // Store temporary device and host pointers
     std::vector<double*> d_forces_locals(ctx->ngpus);
+    // CRITICAL FIX: Allocate host memory outside loop to avoid use-after-free with cudaMemcpyAsync
+    std::vector<std::vector<double>> local_forces_all(ctx->ngpus);
 
-    // PHASE 1: Launch kernels on all GPUs asynchronously
+    // PHASE 0: Pre-allocate device memory (cudaMalloc is synchronous, must be outside async loop)
+    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+        GPUDomain* domain = ctx->domains[gpu];
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+        CUDA_CHECK_MULTI(cudaMalloc(&d_forces_locals[gpu], domain->natoms_local * 3 * sizeof(double)), gpu);
+    }
+
+    // PHASE 1: Pack forces and launch kernels on all GPUs asynchronously
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
         CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         // Pack forces for this domain
-        std::vector<double> local_forces(domain->natoms_local * 3);
+        local_forces_all[gpu].resize(domain->natoms_local * 3);
         for (int i = 0; i < domain->natoms_local; ++i) {
             int global_idx = domain->local_atom_indices[i];
             for (int d = 0; d < 3; ++d) {
-                local_forces[i * 3 + d] = forces[global_idx * 3 + d];
+                local_forces_all[gpu][i * 3 + d] = forces[global_idx * 3 + d];
             }
         }
 
-        // Allocate and copy forces to device asynchronously
-        CUDA_CHECK_MULTI(cudaMalloc(&d_forces_locals[gpu], domain->natoms_local * 3 * sizeof(double)), gpu);
-        CUDA_CHECK_MULTI(cudaMemcpyAsync(d_forces_locals[gpu], local_forces.data(),
+        // Copy forces to device asynchronously
+        CUDA_CHECK_MULTI(cudaMemcpyAsync(d_forces_locals[gpu], local_forces_all[gpu].data(),
                                     domain->natoms_local * 3 * sizeof(double),
                                     cudaMemcpyHostToDevice, ctx->streams[gpu]), gpu);
 
@@ -457,7 +491,7 @@ void multi_gpu_velocity_verlet_step_a(
     // PHASE 3: Cleanup temporary memory
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
-        cudaFree(d_forces_locals[gpu]);
+        CUDA_CHECK_MULTI(cudaFree(d_forces_locals[gpu]), gpu);
     }
 
     // Exchange halo regions after position update
@@ -471,32 +505,38 @@ void multi_gpu_velocity_verlet_step_b(
     double* kinetic_energy,
     double* kinetic_tensor
 ) {
-    // Store temporary device pointers for cleanup
+    // Store temporary device and host pointers
     std::vector<double*> d_forces_locals(ctx->ngpus);
     std::vector<double*> d_kes(ctx->ngpus);
     std::vector<double*> d_ke_tensors(ctx->ngpus);
+    // CRITICAL FIX: Allocate host memory outside loop to avoid use-after-free with cudaMemcpyAsync
+    std::vector<std::vector<double>> local_forces_all(ctx->ngpus);
 
-    // PHASE 1: Launch kernels on all GPUs asynchronously
+    // PHASE 0: Pre-allocate device memory (cudaMalloc is synchronous, must be outside async loop)
+    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+        GPUDomain* domain = ctx->domains[gpu];
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+        CUDA_CHECK_MULTI(cudaMalloc(&d_forces_locals[gpu], domain->natoms_local * 3 * sizeof(double)), gpu);
+        CUDA_CHECK_MULTI(cudaMalloc(&d_kes[gpu], sizeof(double)), gpu);
+        CUDA_CHECK_MULTI(cudaMalloc(&d_ke_tensors[gpu], 9 * sizeof(double)), gpu);
+    }
+
+    // PHASE 1: Pack forces and launch kernels on all GPUs asynchronously
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
         CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
         // Pack forces
-        std::vector<double> local_forces(domain->natoms_local * 3);
+        local_forces_all[gpu].resize(domain->natoms_local * 3);
         for (int i = 0; i < domain->natoms_local; ++i) {
             int global_idx = domain->local_atom_indices[i];
             for (int d = 0; d < 3; ++d) {
-                local_forces[i * 3 + d] = forces[global_idx * 3 + d];
+                local_forces_all[gpu][i * 3 + d] = forces[global_idx * 3 + d];
             }
         }
 
-        // Allocate device memory
-        CUDA_CHECK_MULTI(cudaMalloc(&d_forces_locals[gpu], domain->natoms_local * 3 * sizeof(double)), gpu);
-        CUDA_CHECK_MULTI(cudaMalloc(&d_kes[gpu], sizeof(double)), gpu);
-        CUDA_CHECK_MULTI(cudaMalloc(&d_ke_tensors[gpu], 9 * sizeof(double)), gpu);
-
         // Copy forces to device asynchronously
-        CUDA_CHECK_MULTI(cudaMemcpyAsync(d_forces_locals[gpu], local_forces.data(),
+        CUDA_CHECK_MULTI(cudaMemcpyAsync(d_forces_locals[gpu], local_forces_all[gpu].data(),
                                     domain->natoms_local * 3 * sizeof(double),
                                     cudaMemcpyHostToDevice, ctx->streams[gpu]), gpu);
 
@@ -540,9 +580,9 @@ void multi_gpu_velocity_verlet_step_b(
     // PHASE 4: Cleanup temporary memory
     for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
         CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
-        cudaFree(d_forces_locals[gpu]);
-        cudaFree(d_kes[gpu]);
-        cudaFree(d_ke_tensors[gpu]);
+        CUDA_CHECK_MULTI(cudaFree(d_forces_locals[gpu]), gpu);
+        CUDA_CHECK_MULTI(cudaFree(d_kes[gpu]), gpu);
+        CUDA_CHECK_MULTI(cudaFree(d_ke_tensors[gpu]), gpu);
     }
 
     // Return total values

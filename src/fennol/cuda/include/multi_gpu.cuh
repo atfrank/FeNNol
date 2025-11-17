@@ -22,6 +22,7 @@ struct GPUDomain {
     int gpu_id;                    // GPU device ID
     int natoms_local;              // Number of atoms in this domain (excluding halo)
     int natoms_with_halo;          // Total atoms including halo
+    int max_halo_capacity;         // Maximum halo atoms that can be stored (for bounds checking)
     int* local_atom_indices;       // Indices of local atoms in global array
     int* halo_atom_indices;        // Indices of halo atoms
 
@@ -34,10 +35,8 @@ struct GPUDomain {
     double* d_forces;              // Local forces
     double* d_masses;              // Local masses
 
-    // Halo communication buffers
+    // Halo communication buffer
     double* d_halo_coords;         // Coordinates from neighboring domains
-    double* d_send_buffer;         // Buffer for sending to neighbors
-    double* d_recv_buffer;         // Buffer for receiving from neighbors
 
     // Neighbor information
     std::vector<int> neighbor_gpus;  // IDs of neighboring GPUs
