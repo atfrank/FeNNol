@@ -37,7 +37,9 @@ class ImplicitSolventModel(ABC):
         """Check if CUDA kernels for this model are available."""
         try:
             from fennol import cuda
-            return hasattr(cuda, f"{self.__class__.__name__.lower()}_energy_forces")
+            # Check for GB CUDA functions
+            return (hasattr(cuda, "gb_compute_born_radii") and
+                    hasattr(cuda, "gb_compute_energy_forces"))
         except (ImportError, AttributeError):
             return False
 

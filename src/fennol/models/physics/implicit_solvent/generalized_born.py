@@ -359,10 +359,66 @@ class GeneralizedBorn(ImplicitSolventModel):
         charges: jnp.ndarray,
         atomic_numbers: jnp.ndarray
     ) -> Tuple[float, jnp.ndarray]:
-        """CUDA implementation (placeholder for future CUDA kernels)."""
-        # TODO: Implement native CUDA kernels
-        # For now, fall back to JAX
-        return self._compute_jax(coords, charges, atomic_numbers, None)
+        """CUDA implementation using native CUDA kernels."""
+        try:
+            from fennol import cuda as fennol_cuda
+            import numpy as np
+
+            # Convert JAX arrays to NumPy for CUDA
+            coords_np = np.array(coords)
+            charges_np = np.array(charges)
+            atomic_numbers_np = np.array(atomic_numbers)
+
+            # Get atomic parameters
+            radii = self.atomic_params.get_radii_array(atomic_numbers_np)
+            b_params, c_params = self.atomic_params.get_obc_params_arrays(atomic_numbers_np)
+
+            # Step 1: Compute Born radii using CUDA
+            born_radii = fennol_cuda.gb_compute_born_radii(
+                coords_np,
+                radii,
+                b_params,
+                c_params,
+                self.cutoff
+            )
+
+            # Step 2: Compute GB electrostatic energy and forces
+            gb_energy_array, gb_forces = fennol_cuda.gb_compute_energy_forces(
+                coords_np,
+                charges_np,
+                born_radii,
+                self.dielectric,
+                self.cutoff
+            )
+
+            gb_energy = float(gb_energy_array[0])
+
+            # Step 3: Compute non-polar term if enabled
+            if self.include_nonpolar:
+                gammas = self.atomic_params.get_surface_tension_array(atomic_numbers_np)
+                np_energy_array, np_forces = fennol_cuda.gb_compute_nonpolar(
+                    coords_np,
+                    born_radii,
+                    gammas,
+                    self.probe_radius
+                )
+
+                np_energy = float(np_energy_array[0])
+                total_energy = gb_energy + np_energy
+                total_forces = gb_forces + np_forces
+            else:
+                total_energy = gb_energy
+                total_forces = gb_forces
+
+            # Convert back to JAX arrays
+            total_energy_jax = jnp.array(total_energy)
+            total_forces_jax = jnp.array(total_forces)
+
+            return total_energy_jax, total_forces_jax
+
+        except (ImportError, AttributeError) as e:
+            print(f"# Warning: CUDA backend not available ({e}), falling back to JAX")
+            return self._compute_jax(coords, charges, atomic_numbers, None)
 
 
 class OBC(GeneralizedBorn):
