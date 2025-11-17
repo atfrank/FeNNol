@@ -2,7 +2,7 @@
 
 This document tracks known bugs and issues in the CUDA native implementation that require future attention.
 
-## Critical Bugs (Fixed in commits 1c9ad81, a3f29aa, 5871e3c, 4daa12c, 819f884, c385092)
+## Critical Bugs (Fixed in commits 1c9ad81, a3f29aa, 5871e3c, 4daa12c, 819f884, c385092, d4826cd)
 
 The following critical bugs were discovered through comprehensive code review and have been **FIXED**:
 
@@ -27,6 +27,8 @@ The following critical bugs were discovered through comprehensive code review an
 ✅ **Multi-GPU** - Synchronous cudaMalloc in async loops (pre-allocation added - commit c385092)
 ✅ **Multi-GPU** - Insufficient buffer size calculation (2.5x safety factor - commit c385092)
 ✅ **Multi-GPU** - Missing error checking in cleanup (safe_free wrapper - commit c385092)
+✅ **Integration kernels** - Race condition from early return (conditional processing - commit d4826cd)
+✅ **Integration kernels** - Memory leaks on exceptions (RAII wrappers - commit d4826cd)
 ✅ **Documentation** - Incorrect Velocity Verlet description (integrate.cuh fixed - commit 5871e3c)
 ✅ **Code quality** - Dead code removed (get_device_ptr() removed - commit 5871e3c)
 
@@ -82,8 +84,11 @@ Current implementation may be correct, but verification is recommended.
 
 ## Summary
 
-**Fixed:** 23 critical bugs and issues across all categories
-- 6 critical bugs in kernels (division by zero, force sign errors, derivative formulas) - commit 1c9ad81
+**Fixed:** 25 critical bugs and issues across all categories
+- 8 critical bugs in kernels:
+  - Division by zero, force sign errors, derivative formulas - commit 1c9ad81
+  - Race condition from early return - commit d4826cd
+  - Memory leaks on exceptions - commit d4826cd
 - 2 memory safety issues in Python bindings (RAII wrappers, input validation) - commit 5871e3c
 - 12 multi-GPU bugs:
   - Initial fixes (initialization, synchronization, boundary assignment, error checking) - commit 5871e3c
@@ -96,4 +101,4 @@ Current implementation may be correct, but verification is recommended.
 
 **Remaining High Priority:** 0 issues
 
-**Recommendation:** All core functionality (single-GPU integration, restraints, physics, Python bindings) and multi-GPU support are now production-ready and memory-safe. The implementation has been thoroughly reviewed by specialized sub-agents and all critical bugs have been fixed. The halo exchange uses host staging for maximum reliability; peer-to-peer GPU transfers or NCCL could be added for performance optimization on systems with NVLink.
+**Recommendation:** All core functionality (single-GPU integration, restraints, physics, Python bindings) and multi-GPU support are now production-ready and memory-safe. The implementation has been thoroughly reviewed by specialized sub-agents through **TWO complete rounds of comprehensive code review** - all critical bugs have been identified and fixed. The code is safe for production use. The halo exchange uses host staging for maximum reliability; peer-to-peer GPU transfers or NCCL could be added for performance optimization on systems with NVLink.
