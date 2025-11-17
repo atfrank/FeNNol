@@ -11,7 +11,14 @@ import optax
 from pathlib import Path
 from typing import Dict, Tuple, List
 import pickle
-from tqdm import tqdm
+
+# Make tqdm optional - only needed for training
+try:
+    from tqdm import tqdm
+except ImportError:
+    # Fallback if tqdm not installed
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
 
 from .gnn_solvent import GNNForcePredictor
 

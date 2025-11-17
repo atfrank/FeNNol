@@ -13,7 +13,7 @@ from functools import partial
 import flax.linen as nn
 
 from .base import ImplicitSolventModel
-from .parameters import ATOMIC_MASSES
+# Note: ATOMIC_MASSES not needed for GNN model
 
 
 class RBFExpansion(nn.Module):
