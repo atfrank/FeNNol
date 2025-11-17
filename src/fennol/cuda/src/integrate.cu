@@ -26,10 +26,18 @@ __global__ void velocity_verlet_step_a_kernel(
         velocities[i] += forces[i] * dt2m;
     }
 
-    // Update positions: x = x + dt * v
+    // First half position update: x = x + (dt/2) * v
+    // Note: Thermostat would be applied between these two half-steps
+    // For now, we do both half-steps here (suitable for NVE)
     for (int d = 0; d < 3; ++d) {
         int i = idx * 3 + d;
-        coordinates[i] += dt * velocities[i];
+        coordinates[i] += dt2 * velocities[i];
+    }
+
+    // Second half position update: x = x + (dt/2) * v
+    for (int d = 0; d < 3; ++d) {
+        int i = idx * 3 + d;
+        coordinates[i] += dt2 * velocities[i];
     }
 }
 
