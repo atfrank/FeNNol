@@ -33,6 +33,9 @@ set(CUDA_SOURCES
     src/physics.cu
     src/thermostats.cu
     src/multi_gpu.cu
+    src/gb_born_radii.cu
+    src/gb_energy_forces.cu
+    src/gb_nonpolar.cu
 )
 
 set(CPP_SOURCES
