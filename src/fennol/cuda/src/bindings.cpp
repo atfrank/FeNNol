@@ -8,6 +8,7 @@
 #include "../include/thermostats.cuh"
 #include "../include/implicit_solvent.cuh"
 #include "../include/gnn_solvent.cuh"
+#include "../include/gnn_mlp.cuh"
 
 namespace py = pybind11;
 
@@ -806,6 +807,70 @@ py::array_t<double> py_gnn_predict_forces(
     return forces;
 }
 
+/**
+ * Python wrapper for dense layer operation.
+ * Computes: Y = activation(X * W + b)
+ */
+py::array_t<double> py_dense_layer(
+    py::array_t<double> input,
+    py::array_t<double> weights,
+    py::array_t<double> bias,
+    std::string activation
+) {
+    auto input_buf = input.request();
+    auto weights_buf = weights.request();
+    auto bias_buf = bias.request();
+
+    // Validate shapes
+    if (input_buf.ndim != 2) {
+        throw std::runtime_error("Input must be 2D array [batch, in_dim]");
+    }
+    if (weights_buf.ndim != 2) {
+        throw std::runtime_error("Weights must be 2D array [in_dim, out_dim]");
+    }
+    if (bias_buf.ndim != 1) {
+        throw std::runtime_error("Bias must be 1D array [out_dim]");
+    }
+
+    int batch = input_buf.shape[0];
+    int in_dim = input_buf.shape[1];
+    int out_dim = weights_buf.shape[1];
+
+    if (weights_buf.shape[0] != in_dim) {
+        throw std::runtime_error("Weights shape mismatch with input");
+    }
+    if (bias_buf.shape[0] != out_dim) {
+        throw std::runtime_error("Bias shape mismatch with weights");
+    }
+
+    // Allocate device memory
+    CudaMemory<double> d_input(batch * in_dim);
+    CudaMemory<double> d_weights(in_dim * out_dim);
+    CudaMemory<double> d_bias(out_dim);
+    CudaMemory<double> d_output(batch * out_dim);
+
+    // Copy to device
+    d_input.copy_to_device(input_buf.ptr);
+    d_weights.copy_to_device(weights_buf.ptr);
+    d_bias.copy_to_device(bias_buf.ptr);
+
+    // Call CUDA function
+    gnn::dense_layer(
+        batch, in_dim, out_dim,
+        d_input.get(),
+        d_weights.get(),
+        d_bias.get(),
+        d_output.get(),
+        activation.c_str()
+    );
+
+    // Copy result to host
+    auto output = py::array_t<double>({batch, out_dim});
+    d_output.copy_from_device(output.request().ptr);
+
+    return output;
+}
+
 } // namespace cuda
 } // namespace fennol
 
@@ -880,4 +945,16 @@ PYBIND11_MODULE(fennol_cuda, m) {
           "Predict solvation forces using GNN model",
           py::arg("coordinates"), py::arg("atomic_numbers"), py::arg("solvent_id"),
           py::arg("cutoff"));
+
+    // GNN MLP layer functions
+    m.def("dense_layer", &fennol::cuda::py_dense_layer,
+          "Dense layer with cuBLAS: Y = activation(X * W + b)",
+          py::arg("input"), py::arg("weights"), py::arg("bias"),
+          py::arg("activation") = "silu");
+
+    // cuBLAS management
+    m.def("init_cublas", &fennol::cuda::gnn::init_cublas,
+          "Initialize cuBLAS handle");
+    m.def("cleanup_cublas", &fennol::cuda::gnn::cleanup_cublas,
+          "Cleanup cuBLAS handle");
 }

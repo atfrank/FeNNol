@@ -38,6 +38,7 @@ set(CUDA_SOURCES
     src/gb_nonpolar.cu
     src/gnn_neighborlist.cu
     src/gnn_message_passing.cu
+    src/gnn_mlp.cu
 )
 
 set(CPP_SOURCES
@@ -59,6 +60,7 @@ target_include_directories(fennol_cuda PRIVATE
 # Link CUDA libraries
 target_link_libraries(fennol_cuda PRIVATE
     CUDA::cudart
+    CUDA::cublas
 )
 
 # Add library search path for pthread on newer Linux systems
