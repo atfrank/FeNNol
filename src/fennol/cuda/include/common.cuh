@@ -3,6 +3,8 @@
 
 #include <cuda_runtime.h>
 #include <cstddef>
+#include <stdexcept>
+#include <string>
 
 namespace fennol {
 namespace cuda {
@@ -20,6 +22,7 @@ namespace cuda {
 constexpr int BLOCK_SIZE = 256;
 constexpr int WARP_SIZE = 32;
 
+#ifdef __CUDACC__
 // Device function for atomic add (double precision)
 __device__ __forceinline__ double atomicAddDouble(double* address, double val) {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
@@ -33,6 +36,7 @@ __device__ __forceinline__ double atomicAddDouble(double* address, double val) {
 
     return __longlong_as_double(old);
 }
+#endif // __CUDACC__
 
 // Vector operations
 struct Vec3 {
@@ -79,6 +83,7 @@ struct Vec3 {
     }
 };
 
+#ifdef __CUDACC__
 // Reduction helper
 template<typename T>
 __device__ T warpReduceSum(T val) {
@@ -104,6 +109,7 @@ __device__ T blockReduceSum(T val) {
 
     return val;
 }
+#endif // __CUDACC__
 
 } // namespace cuda
 } // namespace fennol

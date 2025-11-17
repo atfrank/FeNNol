@@ -69,7 +69,6 @@ class CMakeBuild(build_ext):
         if 'CMAKE_CUDA_ARCHITECTURES' not in os.environ:
             # Try to detect GPU architecture
             try:
-                import subprocess
                 result = subprocess.run(
                     ['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
                     capture_output=True,
