@@ -251,32 +251,160 @@ void distribute_atoms(
 
         std::cout << "# GPU " << gpu << ": " << domain->natoms_local << " atoms\n";
     }
-}
 
-void exchange_halos(MultiGPUContext* ctx) {
-    // Simplified halo exchange using host memory staging
-    // For production, would use peer-to-peer or NCCL
-
-    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+    // Set up neighbor information and allocate halo buffers
+    for (int gpu = 0; gpu < ngpus; ++gpu) {
         GPUDomain* domain = ctx->domains[gpu];
         CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
 
-        // Copy halo data from neighboring domains
-        // In real implementation, would identify atoms in halo regions
-        // and communicate only those atoms
+        // Determine neighbors (1D decomposition: left and right)
+        domain->neighbor_gpus.clear();
+        domain->send_counts.clear();
+        domain->recv_counts.clear();
 
-        // For now, this is a placeholder
-        // Full implementation would:
-        // 1. Identify atoms near domain boundaries
-        // 2. Pack into send buffer
-        // 3. Copy to neighboring GPU (via peer access or host staging)
-        // 4. Unpack into halo region
+        if (gpu > 0) {
+            domain->neighbor_gpus.push_back(gpu - 1);  // Left neighbor
+        }
+        if (gpu < ngpus - 1) {
+            domain->neighbor_gpus.push_back(gpu + 1);  // Right neighbor
+        }
+
+        // Estimate maximum halo atoms (conservative estimate)
+        // Assume uniform density: atoms_per_unit = natoms / box_volume
+        double box_volume = box_size[0] * box_size[1] * box_size[2];
+        double density = natoms / box_volume;
+        // Halo region volume: 2 * cutoff * box_y * box_z (left and right boundaries)
+        double halo_volume = 2.0 * ctx->cutoff * box_size[1] * box_size[2];
+        int max_halo_atoms = static_cast<int>(density * halo_volume * 1.5);  // 1.5x safety factor
+        max_halo_atoms = std::max(max_halo_atoms, 100);  // Minimum buffer size
+
+        // Allocate halo buffers on device
+        // Each neighbor can send up to max_halo_atoms/2
+        int buffer_size = max_halo_atoms / 2;
+        CUDA_CHECK_MULTI(cudaMalloc(&domain->d_send_buffer, buffer_size * 3 * sizeof(double)), gpu);
+        CUDA_CHECK_MULTI(cudaMalloc(&domain->d_recv_buffer, buffer_size * 3 * sizeof(double)), gpu);
+        CUDA_CHECK_MULTI(cudaMalloc(&domain->d_halo_coords, max_halo_atoms * 3 * sizeof(double)), gpu);
+
+        // Initialize send/recv counts for each neighbor
+        for (size_t i = 0; i < domain->neighbor_gpus.size(); ++i) {
+            domain->send_counts.push_back(0);
+            domain->recv_counts.push_back(0);
+        }
+    }
+}
+
+void exchange_halos(MultiGPUContext* ctx) {
+    // Halo exchange for 1D domain decomposition along X-axis
+    // Each GPU exchanges boundary atoms with its neighbors
+
+    int ngpus = ctx->ngpus;
+    double cutoff = ctx->cutoff;
+
+    // Storage for boundary atoms from each GPU
+    std::vector<std::vector<double>> left_boundary_atoms(ngpus);   // Atoms to send to left neighbor
+    std::vector<std::vector<double>> right_boundary_atoms(ngpus);  // Atoms to send to right neighbor
+
+    // PHASE 1: Identify and extract boundary atoms from each GPU
+    for (int gpu = 0; gpu < ngpus; ++gpu) {
+        GPUDomain* domain = ctx->domains[gpu];
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+
+        // Copy coordinates from device to host
+        std::vector<double> coords(domain->natoms_local * 3);
+        CUDA_CHECK_MULTI(cudaMemcpy(coords.data(), domain->d_coordinates,
+                                    domain->natoms_local * 3 * sizeof(double),
+                                    cudaMemcpyDeviceToHost), gpu);
+
+        // Compute domain boundaries (core domain without halo)
+        double domain_width = domain->bounds[1] - domain->bounds[0] - 2.0 * cutoff;  // Remove halo margins
+        double xmin = domain->bounds[0] + cutoff;  // Core domain start
+        double xmax = domain->bounds[1] - cutoff;  // Core domain end
+
+        // Identify atoms in left boundary (to send to left neighbor)
+        if (gpu > 0) {
+            for (int i = 0; i < domain->natoms_local; ++i) {
+                double x = coords[i * 3 + 0];
+                if (x >= xmin && x < xmin + cutoff) {
+                    // Atom is in left boundary region
+                    left_boundary_atoms[gpu].push_back(coords[i * 3 + 0]);
+                    left_boundary_atoms[gpu].push_back(coords[i * 3 + 1]);
+                    left_boundary_atoms[gpu].push_back(coords[i * 3 + 2]);
+                }
+            }
+        }
+
+        // Identify atoms in right boundary (to send to right neighbor)
+        if (gpu < ngpus - 1) {
+            for (int i = 0; i < domain->natoms_local; ++i) {
+                double x = coords[i * 3 + 0];
+                if (x > xmax - cutoff && x <= xmax) {
+                    // Atom is in right boundary region
+                    right_boundary_atoms[gpu].push_back(coords[i * 3 + 0]);
+                    right_boundary_atoms[gpu].push_back(coords[i * 3 + 1]);
+                    right_boundary_atoms[gpu].push_back(coords[i * 3 + 2]);
+                }
+            }
+        }
     }
 
-    // Synchronize all GPUs
-    for (int gpu = 0; gpu < ctx->ngpus; ++gpu) {
+    // PHASE 2: Transfer boundary atoms to neighboring GPUs using host staging
+    for (int gpu = 0; gpu < ngpus; ++gpu) {
+        GPUDomain* domain = ctx->domains[gpu];
         CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
-        cudaStreamSynchronize(ctx->streams[gpu]);
+
+        // Collect halo atoms for this GPU from its neighbors
+        std::vector<double> halo_atoms;
+
+        // Receive from left neighbor (their right boundary becomes our left halo)
+        if (gpu > 0) {
+            halo_atoms.insert(halo_atoms.end(),
+                            right_boundary_atoms[gpu - 1].begin(),
+                            right_boundary_atoms[gpu - 1].end());
+        }
+
+        // Receive from right neighbor (their left boundary becomes our right halo)
+        if (gpu < ngpus - 1) {
+            halo_atoms.insert(halo_atoms.end(),
+                            left_boundary_atoms[gpu + 1].begin(),
+                            left_boundary_atoms[gpu + 1].end());
+        }
+
+        // Update halo atom count
+        domain->natoms_with_halo = domain->natoms_local + (halo_atoms.size() / 3);
+
+        // Copy halo atoms to device
+        if (!halo_atoms.empty()) {
+            CUDA_CHECK_MULTI(cudaMemcpy(domain->d_halo_coords, halo_atoms.data(),
+                                        halo_atoms.size() * sizeof(double),
+                                        cudaMemcpyHostToDevice), gpu);
+        }
+
+        // Update send/recv counts for statistics
+        int neighbor_idx = 0;
+        if (gpu > 0) {
+            int received_from_left = right_boundary_atoms[gpu - 1].size() / 3;
+            domain->recv_counts[neighbor_idx] = received_from_left;
+            neighbor_idx++;
+        }
+        if (gpu < ngpus - 1) {
+            int received_from_right = left_boundary_atoms[gpu + 1].size() / 3;
+            domain->recv_counts[neighbor_idx] = received_from_right;
+        }
+
+        neighbor_idx = 0;
+        if (gpu > 0) {
+            domain->send_counts[neighbor_idx] = left_boundary_atoms[gpu].size() / 3;
+            neighbor_idx++;
+        }
+        if (gpu < ngpus - 1) {
+            domain->send_counts[neighbor_idx] = right_boundary_atoms[gpu].size() / 3;
+        }
+    }
+
+    // PHASE 3: Synchronize all GPUs
+    for (int gpu = 0; gpu < ngpus; ++gpu) {
+        CUDA_CHECK_MULTI(cudaSetDevice(gpu), gpu);
+        CUDA_CHECK_MULTI(cudaStreamSynchronize(ctx->streams[gpu]), gpu);
     }
 }
 
