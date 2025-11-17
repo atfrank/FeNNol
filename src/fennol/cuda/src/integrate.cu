@@ -18,6 +18,7 @@ __global__ void velocity_verlet_step_a_kernel(
     if (idx >= natoms) return;
 
     double mass = masses[idx];
+    if (mass < 1e-10) return;  // Skip atoms with invalid mass
     double dt2m = dt2 / mass;
 
     // Update velocities: v = v + (dt/2) * f / m
@@ -77,6 +78,7 @@ __global__ void velocity_verlet_step_b_kernel(
 
     if (idx < natoms) {
         double mass = masses[idx];
+        if (mass < 1e-10) return;  // Skip atoms with invalid mass
         double dt2m = dt2 / mass;
 
         Vec3 vel;

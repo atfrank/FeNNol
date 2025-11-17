@@ -281,10 +281,10 @@ __global__ void flat_bottom_distance_restraint_kernel(
     double energy = 0.5 * k * violation * violation;
     partial_energies[idx] = energy;
 
-    // Force is k*violation*sign(diff)
+    // Force is -k*violation*sign(diff) (negative of energy gradient)
     // Only non-zero when outside the tolerance
     if (violation > 1e-10 && r > 1e-10) {
-        double sign = (diff > 0) ? 1.0 : -1.0;
+        double sign = (diff > 0) ? -1.0 : 1.0;  // Inverted to pull atoms together when too far
         double force_mag = k * violation * sign;
         Vec3 force_dir = rij * (force_mag / r);
 
@@ -731,8 +731,8 @@ __global__ void backside_attack_restraint_kernel(
         double dr = d_nu_c - target_dist;
         energy += 0.5 * k_dist * dr * dr;
 
-        // Distance forces
-        double force_mag = k_dist * dr;
+        // Distance forces (negative of energy gradient to pull atoms together)
+        double force_mag = -k_dist * dr;
         Vec3 force_dir = r_nu_c * (1.0 / d_nu_c);
         Vec3 f = force_dir * force_mag;
 
@@ -779,7 +779,7 @@ void backside_attack_restraint(
     for (int i = 0; i < nrestraints; ++i) {
         total_energy += h_partial_energies[i];
     }
-    *energy = total_energy;
+    CUDA_CHECK(cudaMemcpy(energy, &total_energy, sizeof(double), cudaMemcpyHostToDevice));
 
     delete[] h_partial_energies;
     CUDA_CHECK(cudaFree(d_partial_energies));

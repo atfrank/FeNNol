@@ -233,7 +233,8 @@ __global__ void zbl_kernel(
     partial_energies[idx] = energy;
 
     // Force: F = -dE/dr
-    double dE_dr = -ke * Zi * Zj * (phi / (r * r) + dphi_dx / (au * r));
+    // dE/dr = ke * Zi * Zj * (dphi/dx/(au*r) - phi/r^2)
+    double dE_dr = ke * Zi * Zj * (dphi_dx / (au * r) - phi / (r * r));
     Vec3 force_vec = rij * (-dE_dr / r);
 
     for (int d = 0; d < 3; ++d) {
@@ -334,9 +335,9 @@ __global__ void nlh_kernel(
     double energy = ke * Zi * Zj * phi / r;
     partial_energies[idx] = energy;
 
-    // Force: F = -dE/dr = -ke * Zi * Zj * d/dr(phi/r)
-    // d/dr(phi/r) = (dphi_dr * r - phi) / r^2
-    double dE_dr = -ke * Zi * Zj * (dphi_dr / r - phi / (r * r));
+    // Force: F = -dE/dr
+    // dE/dr = ke * Zi * Zj * d/dr(phi/r) = ke * Zi * Zj * (dphi/dr/r - phi/r^2)
+    double dE_dr = ke * Zi * Zj * (dphi_dr / r - phi / (r * r));
     Vec3 force_vec = rij * (-dE_dr / r);
 
     for (int d = 0; d < 3; ++d) {
