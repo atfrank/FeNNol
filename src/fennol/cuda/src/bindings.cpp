@@ -393,6 +393,67 @@ py::tuple py_velocity_rescale_thermostat(
     return py::make_tuple(velocities, current_temp);
 }
 
+py::tuple py_backside_attack_restraint(
+    py::array_t<double> coordinates,
+    py::array_t<int> restraint_indices,
+    py::array_t<double> target_angles,
+    py::array_t<double> angle_force_constants,
+    py::array_t<double> target_distances,
+    py::array_t<double> distance_force_constants
+) {
+    auto coords_buf = coordinates.request();
+    auto indices_buf = restraint_indices.request();
+    auto angles_buf = target_angles.request();
+    auto angle_fcs_buf = angle_force_constants.request();
+    auto dists_buf = target_distances.request();
+    auto dist_fcs_buf = distance_force_constants.request();
+
+    int natoms = coords_buf.shape[0];
+    int nrestraints = indices_buf.shape[0];
+
+    double *d_coords, *d_angles, *d_angle_fcs, *d_dists, *d_dist_fcs, *d_energy, *d_forces;
+    int *d_indices;
+
+    CUDA_CHECK(cudaMalloc(&d_coords, natoms * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_indices, nrestraints * 3 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_angles, nrestraints * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_angle_fcs, nrestraints * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_dists, nrestraints * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_dist_fcs, nrestraints * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_energy, sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_forces, natoms * 3 * sizeof(double)));
+
+    CUDA_CHECK(cudaMemset(d_forces, 0, natoms * 3 * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(d_coords, coords_buf.ptr, natoms * 3 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_indices, indices_buf.ptr, nrestraints * 3 * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_angles, angles_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_angle_fcs, angle_fcs_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dists, dists_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dist_fcs, dist_fcs_buf.ptr, nrestraints * sizeof(double), cudaMemcpyHostToDevice));
+
+    backside_attack_restraint(d_coords, d_indices, d_angles, d_angle_fcs, d_dists, d_dist_fcs,
+                              natoms, nrestraints, d_energy, d_forces);
+
+    double energy;
+    auto forces = py::array_t<double>({natoms, 3});
+    auto forces_buf = forces.request();
+
+    CUDA_CHECK(cudaMemcpy(&energy, d_energy, sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(forces_buf.ptr, d_forces, natoms * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_coords));
+    CUDA_CHECK(cudaFree(d_indices));
+    CUDA_CHECK(cudaFree(d_angles));
+    CUDA_CHECK(cudaFree(d_angle_fcs));
+    CUDA_CHECK(cudaFree(d_dists));
+    CUDA_CHECK(cudaFree(d_dist_fcs));
+    CUDA_CHECK(cudaFree(d_energy));
+    CUDA_CHECK(cudaFree(d_forces));
+
+    return py::make_tuple(energy, forces);
+}
+
 } // namespace cuda
 } // namespace fennol
 
@@ -440,4 +501,9 @@ PYBIND11_MODULE(fennol_cuda, m) {
     m.def("velocity_rescale_thermostat", &fennol::cuda::py_velocity_rescale_thermostat,
           "Velocity rescaling thermostat",
           py::arg("velocities"), py::arg("masses"), py::arg("target_temperature"));
+
+    m.def("backside_attack_restraint", &fennol::cuda::py_backside_attack_restraint,
+          "Backside attack restraint for SN2 reactions (combines angle and distance restraints)",
+          py::arg("coordinates"), py::arg("restraint_indices"), py::arg("target_angles"),
+          py::arg("angle_force_constants"), py::arg("target_distances"), py::arg("distance_force_constants"));
 }

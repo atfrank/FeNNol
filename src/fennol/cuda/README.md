@@ -69,6 +69,12 @@ cuda/
   - No penalty within tolerance region
   - Allows controlled flexibility
 
+- **`backside_attack_restraint`**: SN2 backside attack geometry
+  - Combines angle (Nu-C-LG) and distance (Nu-C) restraints
+  - Encourages linear nucleophilic attack geometry (180°)
+  - Critical for transition state searching of SN2 reactions
+  - Single kernel for improved efficiency
+
 - **`harmonic_angle_restraint`**: Angle restraints
   - E = 0.5 * k * (θ - θ0)²
   - Full analytical force derivatives

@@ -646,6 +646,146 @@ void spherical_boundary_restraint(
 }
 
 // RMSD restraint (stub - complex implementation)
+// Backside attack restraint kernel
+// Combines angle and distance restraints for SN2 reactions
+__global__ void backside_attack_restraint_kernel(
+    const double* coordinates,
+    const int* restraint_indices,
+    const double* target_angles,
+    const double* angle_force_constants,
+    const double* target_distances,
+    const double* distance_force_constants,
+    int nrestraints,
+    double* partial_energies,
+    double* forces
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nrestraints) return;
+
+    // Get atom indices (nucleophile, carbon, leaving_group)
+    int nu = restraint_indices[idx * 3 + 0];
+    int carbon = restraint_indices[idx * 3 + 1];
+    int lg = restraint_indices[idx * 3 + 2];
+
+    Vec3 r_nu(coordinates[nu * 3 + 0], coordinates[nu * 3 + 1], coordinates[nu * 3 + 2]);
+    Vec3 r_c(coordinates[carbon * 3 + 0], coordinates[carbon * 3 + 1], coordinates[carbon * 3 + 2]);
+    Vec3 r_lg(coordinates[lg * 3 + 0], coordinates[lg * 3 + 1], coordinates[lg * 3 + 2]);
+
+    double energy = 0.0;
+
+    // --- Angle Restraint (Nu-C-LG) ---
+    Vec3 r_nu_c = r_nu - r_c;
+    Vec3 r_lg_c = r_lg - r_c;
+
+    double d_nu_c = r_nu_c.norm();
+    double d_lg_c = r_lg_c.norm();
+
+    if (d_nu_c > 1e-10 && d_lg_c > 1e-10) {
+        // Compute angle
+        double cos_theta = r_nu_c.dot(r_lg_c) / (d_nu_c * d_lg_c);
+        cos_theta = fmax(-1.0, fmin(1.0, cos_theta));
+        double theta = acos(cos_theta);
+
+        double theta0 = target_angles[idx];
+        double k_angle = angle_force_constants[idx];
+
+        // Angle energy
+        double dtheta = theta - theta0;
+        energy += 0.5 * k_angle * dtheta * dtheta;
+
+        // Angle forces
+        if (fabs(sin(theta)) > 1e-10) {
+            double dE_dtheta = k_angle * dtheta;
+
+            // Derivatives of angle w.r.t. positions
+            Vec3 n_nu_c = r_nu_c * (1.0 / d_nu_c);
+            Vec3 n_lg_c = r_lg_c * (1.0 / d_lg_c);
+
+            Vec3 dtheta_dr_nu = (n_lg_c - n_nu_c * cos_theta) * (1.0 / (d_nu_c * sin(theta)));
+            Vec3 dtheta_dr_lg = (n_nu_c - n_lg_c * cos_theta) * (1.0 / (d_lg_c * sin(theta)));
+            Vec3 dtheta_dr_c = (dtheta_dr_nu + dtheta_dr_lg) * (-1.0);
+
+            Vec3 f_nu = dtheta_dr_nu * (-dE_dtheta);
+            Vec3 f_lg = dtheta_dr_lg * (-dE_dtheta);
+            Vec3 f_c = dtheta_dr_c * (-dE_dtheta);
+
+            // Accumulate forces
+            for (int d = 0; d < 3; ++d) {
+                double val_nu = (d == 0) ? f_nu.x : (d == 1) ? f_nu.y : f_nu.z;
+                double val_lg = (d == 0) ? f_lg.x : (d == 1) ? f_lg.y : f_lg.z;
+                double val_c = (d == 0) ? f_c.x : (d == 1) ? f_c.y : f_c.z;
+
+                atomicAddDouble(&forces[nu * 3 + d], val_nu);
+                atomicAddDouble(&forces[lg * 3 + d], val_lg);
+                atomicAddDouble(&forces[carbon * 3 + d], val_c);
+            }
+        }
+    }
+
+    // --- Distance Restraint (Nu-C) ---
+    double target_dist = target_distances[idx];
+    if (target_dist > 0.0 && d_nu_c > 1e-10) {
+        double k_dist = distance_force_constants[idx];
+
+        // Distance energy
+        double dr = d_nu_c - target_dist;
+        energy += 0.5 * k_dist * dr * dr;
+
+        // Distance forces
+        double force_mag = k_dist * dr;
+        Vec3 force_dir = r_nu_c * (1.0 / d_nu_c);
+        Vec3 f = force_dir * force_mag;
+
+        for (int d = 0; d < 3; ++d) {
+            double val = (d == 0) ? f.x : (d == 1) ? f.y : f.z;
+            atomicAddDouble(&forces[nu * 3 + d], val);
+            atomicAddDouble(&forces[carbon * 3 + d], -val);
+        }
+    }
+
+    partial_energies[idx] = energy;
+}
+
+void backside_attack_restraint(
+    const double* coordinates,
+    const int* restraint_indices,
+    const double* target_angles,
+    const double* angle_force_constants,
+    const double* target_distances,
+    const double* distance_force_constants,
+    int natoms,
+    int nrestraints,
+    double* energy,
+    double* forces
+) {
+    double* d_partial_energies;
+    CUDA_CHECK(cudaMalloc(&d_partial_energies, nrestraints * sizeof(double)));
+
+    int nblocks = (nrestraints + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    backside_attack_restraint_kernel<<<nblocks, BLOCK_SIZE>>>(
+        coordinates, restraint_indices, target_angles, angle_force_constants,
+        target_distances, distance_force_constants, nrestraints,
+        d_partial_energies, forces
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Reduce energies
+    double* h_partial_energies = new double[nrestraints];
+    CUDA_CHECK(cudaMemcpy(h_partial_energies, d_partial_energies,
+                          nrestraints * sizeof(double), cudaMemcpyDeviceToHost));
+
+    double total_energy = 0.0;
+    for (int i = 0; i < nrestraints; ++i) {
+        total_energy += h_partial_energies[i];
+    }
+    *energy = total_energy;
+
+    delete[] h_partial_energies;
+    CUDA_CHECK(cudaFree(d_partial_energies));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 void rmsd_restraint(
     const double* coordinates,
     const double* reference,

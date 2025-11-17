@@ -154,6 +154,35 @@ void harmonic_dihedral_restraint(
 );
 
 /**
+ * Backside attack restraint for SN2 reactions
+ * Combines angle (Nu-C-LG) and optional distance (Nu-C) restraints
+ * E = E_angle + E_distance (if enabled)
+ *
+ * @param coordinates [natoms, 3] - atomic coordinates
+ * @param restraint_indices [nrestraints, 3] - triplets of (nucleophile, carbon, leaving_group)
+ * @param target_angles [nrestraints] - target angles (typically π for 180°)
+ * @param angle_force_constants [nrestraints] - angle force constants
+ * @param target_distances [nrestraints] - target Nu-C distances (0 = no distance restraint)
+ * @param distance_force_constants [nrestraints] - distance force constants
+ * @param natoms - number of atoms
+ * @param nrestraints - number of restraints
+ * @param energy [out] - total restraint energy
+ * @param forces [natoms, 3, out] - restraint forces (accumulated)
+ */
+void backside_attack_restraint(
+    const double* coordinates,
+    const int* restraint_indices,
+    const double* target_angles,
+    const double* angle_force_constants,
+    const double* target_distances,
+    const double* distance_force_constants,
+    int natoms,
+    int nrestraints,
+    double* energy,
+    double* forces
+);
+
+/**
  * Spherical boundary restraint
  * E = 0.5 * k * max(0, r - r0)^2 for each atom
  *
