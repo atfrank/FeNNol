@@ -639,10 +639,11 @@ __global__ void apply_born_forces_tiled(
                 double zj = s_coords[t * 3 + 2];
                 double rho_j = s_intrinsic_radii[t];
 
-                // Compute distance
-                double dx = xi - xj;
-                double dy = yi - yj;
-                double dz = zi - zj;
+                // Compute displacement vector (j - i), matching OpenMM's getDeltaR
+                // OpenMM uses: getDeltaR(atomI, atomJ) = atomJ - atomI
+                double dx = xj - xi;
+                double dy = yj - yi;
+                double dz = zj - zi;
                 double r_sq = dx * dx + dy * dy + dz * dz;
 
                 // Apply cutoff
@@ -652,42 +653,54 @@ __global__ void apply_born_forces_tiled(
                 double r_inv = 1.0 / r;
 
                 // Compute ∂ψᵢ/∂rᵢⱼ (derivative of descreening integral for atom i)
-                // This tells us how ψᵢ changes when atom i moves away from j
+                // This tells us how ψᵢ changes when distance r changes
                 double dpsi_i_dr = descreening_integral_derivative(r, rho_i, rho_j);
 
-                // Force magnitude on atom i from its own ψᵢ contribution ONLY:
-                // F_i = -(∂E/∂ψᵢ)×(∂ψᵢ/∂r)
+                // Force magnitude from ψᵢ changing (matches OpenMM's approach):
+                // de = (∂E/∂ψᵢ) × (∂ψᵢ/∂r) / r
                 //
-                // Note: We do NOT include the ∂E/∂ψⱼ term here because:
-                // - Thread i processes pair (i,j) and computes force on i from ψᵢ
-                // - Thread j processes pair (j,i) and computes force on j from ψⱼ
-                // - Including both would double-count!
+                // OpenMM computes: de = bornForces[i] * t3 * r_inv
+                // where bornForces[i] already contains ∂E/∂ψᵢ and t3/r = ∂ψᵢ/∂r
                 //
-                // The ∂E/∂ψⱼ contribution to forces on i will be handled when
-                // thread j processes pair (j,i) via Newton's 3rd law.
-                double force_mag = -dE_dpsi_i * dpsi_i_dr;
+                // This force is applied to BOTH atoms (Newton's 3rd law):
+                // - Subtract from atom i: forces[i] -= de × (rⱼ - rᵢ)
+                // - Add to atom j: forces[j] += de × (rⱼ - rᵢ)
+                double de = dE_dpsi_i * dpsi_i_dr * r_inv;
+
+                // Displacement vector components (already computed as dx, dy, dz = rᵢ - rⱼ)
+                double force_x = de * dx;
+                double force_y = de * dy;
+                double force_z = de * dz;
 
                 // DEBUG: Print for first pair (0,1)
                 if (i == 0 && j == 1) {
                     printf("GPU[apply_born_forces]: pair (0,1): dE_dpsi_i=%.8f\n", dE_dpsi_i);
                     printf("GPU[apply_born_forces]: pair (0,1): dpsi_i_dr=%.8f\n", dpsi_i_dr);
-                    printf("GPU[apply_born_forces]: pair (0,1): force_mag=%.8f\n", force_mag);
+                    printf("GPU[apply_born_forces]: pair (0,1): de=%.8f\n", de);
+                    printf("GPU[apply_born_forces]: pair (0,1): force=%.8f, %.8f, %.8f\n", force_x, force_y, force_z);
                 }
 
-                // Accumulate force on atom i
-                fx_born_i += force_mag * dx * r_inv;
-                fy_born_i += force_mag * dy * r_inv;
-                fz_born_i += force_mag * dz * r_inv;
+                // Accumulate force on atom i (subtract)
+                fx_born_i -= force_x;
+                fy_born_i -= force_y;
+                fz_born_i -= force_z;
+
+                // Apply force to atom j (add) using atomicAdd since j is in shared memory tile
+                // Note: This creates equal and opposite forces on the two atoms
+                atomicAdd(&born_forces[j * 3 + 0], force_x);
+                atomicAdd(&born_forces[j * 3 + 1], force_y);
+                atomicAdd(&born_forces[j * 3 + 2], force_z);
             }
         }
         __syncthreads();
     }
 
-    // Write Born radii force contribution for atom i
+    // Write Born radii force contribution for atom i using atomicAdd
+    // (since other threads may have added forces to this atom via Newton's 3rd law)
     if (i < natoms) {
-        born_forces[i * 3 + 0] = fx_born_i;
-        born_forces[i * 3 + 1] = fy_born_i;
-        born_forces[i * 3 + 2] = fz_born_i;
+        atomicAdd(&born_forces[i * 3 + 0], fx_born_i);
+        atomicAdd(&born_forces[i * 3 + 1], fy_born_i);
+        atomicAdd(&born_forces[i * 3 + 2], fz_born_i);
 
         // DEBUG: Print final force for atom 0
         if (i == 0) {
