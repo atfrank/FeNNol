@@ -33,8 +33,9 @@ __device__ void compute_f_gb_and_deriv(
     f_gb = sqrt(arg);
 
     // Derivative: df_GB/dr = (2r - R_i*R_j*exp_term * r/(2*R_i*R_j)) / (2*f_GB)
-    //                      = r * (1 - exp_term/2) / f_GB
-    df_gb_dr = r * (1.0 - 0.5 * exp_term) / f_gb;
+    //                      = (2r - r*exp_term/2) / (2*f_GB)
+    //                      = r * (1 - exp_term/4) / f_GB
+    df_gb_dr = r * (1.0 - 0.25 * exp_term) / f_gb;
 }
 
 /**

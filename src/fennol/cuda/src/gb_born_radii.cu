@@ -281,6 +281,54 @@ void compute_born_radii_obc(
 }
 
 /**
+ * Host function to compute Born radii AND return psi_sum for force derivatives.
+ *
+ * This version returns the descreening sum which is needed for computing
+ * accurate forces including Born radii derivatives.
+ */
+void compute_born_radii_obc_with_psi(
+    int natoms,
+    const double* coords,
+    const double* intrinsic_radii,
+    const double* b_params,
+    const double* c_params,
+    double cutoff,
+    double* born_radii,
+    double* psi_sum  // Output: descreening sum for each atom
+) {
+    // Launch configuration
+    int threads_per_block = 256;
+    int num_blocks = (natoms + threads_per_block - 1) / threads_per_block;
+
+    // Shared memory size for tiled kernel
+    int shared_mem_size = threads_per_block * 4 * sizeof(double);
+
+    // Step 1: Compute descreening integrals
+    compute_descreening_kernel_tiled<<<num_blocks, threads_per_block, shared_mem_size>>>(
+        natoms,
+        coords,
+        intrinsic_radii,
+        cutoff,
+        psi_sum  // Return this for force calculation
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 2: Compute Born radii from descreening
+    compute_born_radii_kernel<<<num_blocks, threads_per_block>>>(
+        natoms,
+        intrinsic_radii,
+        b_params,
+        c_params,
+        psi_sum,
+        born_radii
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Synchronize to ensure completion
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+/**
  * Host function to compute Born radii using BASIC (unoptimized) kernel
  *
  * This is kept for comparison and testing purposes.

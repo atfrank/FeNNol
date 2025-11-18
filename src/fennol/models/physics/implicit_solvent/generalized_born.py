@@ -99,25 +99,23 @@ class GeneralizedBorn(ImplicitSolventModel):
         atomic_numbers: jnp.ndarray,
         box: Optional[jnp.ndarray] = None
     ) -> Tuple[float, jnp.ndarray]:
-        """JAX implementation of GB energy and forces."""
+        """JAX implementation of GB energy and forces with FULL derivatives."""
 
         # Get atomic parameters
         radii = self.atomic_params.get_radii_array(atomic_numbers)
         b_params, c_params = self.atomic_params.get_obc_params_arrays(atomic_numbers)
 
-        # Step 1: Compute Born radii
-        born_radii = self._compute_born_radii_jax(coords, radii, b_params, c_params, box)
-
-        # Step 2: Compute electrostatic GB energy and forces
-        gb_energy, gb_forces = self._compute_gb_electrostatic_jax(
-            coords, charges, born_radii, box
+        # Step 1 & 2: Compute GB electrostatic energy and forces
+        # Using FULL derivative version that includes Born radii derivatives
+        gb_energy, gb_forces = self._compute_gb_electrostatic_jax_full(
+            coords, charges, atomic_numbers, box
         )
 
         # Step 3: Compute non-polar (surface area) term if enabled
         if self.include_nonpolar:
             gammas = self.atomic_params.get_surface_tension_array(atomic_numbers)
             np_energy, np_forces = self._compute_nonpolar_jax(
-                coords, radii, born_radii, gammas, box
+                coords, radii, atomic_numbers, gammas, box
             )
             total_energy = gb_energy + np_energy
             total_forces = gb_forces + np_forces
@@ -241,6 +239,12 @@ class GeneralizedBorn(ImplicitSolventModel):
         """
         Compute GB electrostatic energy and forces.
 
+        IMPORTANT: This version treats born_radii as fixed, which is INCORRECT!
+        Forces are missing the Born radii derivative contributions: ∂E/∂R_i * ∂R_i/∂r
+
+        This is kept for compatibility but should not be used for accurate forces.
+        Use _compute_gb_electrostatic_jax_full() instead.
+
         Args:
             coords: Atomic coordinates [natoms, 3]
             charges: Partial charges [natoms]
@@ -249,12 +253,53 @@ class GeneralizedBorn(ImplicitSolventModel):
 
         Returns:
             energy: GB electrostatic energy (kcal/mol)
-            forces: Forces [natoms, 3] (kcal/mol/Å)
+            forces: INCOMPLETE Forces [natoms, 3] (kcal/mol/Å) - missing Born radii derivatives!
         """
         # Use automatic differentiation for forces
+        # WARNING: This only computes ∂E/∂r, missing ∂E/∂R_i * ∂R_i/∂r
         energy_fn = lambda x: self._gb_energy_only(x, charges, born_radii, box)
         energy = energy_fn(coords)
-        forces = -jax.grad(energy_fn)(coords)  # F = -dE/dr
+        forces = -jax.grad(energy_fn)(coords)  # F = -dE/dr (INCOMPLETE!)
+
+        return energy, forces
+
+    def _compute_gb_electrostatic_jax_full(
+        self,
+        coords: jnp.ndarray,
+        charges: jnp.ndarray,
+        atomic_numbers: jnp.ndarray,
+        box: Optional[jnp.ndarray] = None
+    ) -> Tuple[float, jnp.ndarray]:
+        """
+        Compute GB electrostatic energy and forces with FULL derivatives.
+
+        This version includes Born radii derivative contributions in forces:
+        F = -∂E/∂r - ∑ᵢ (∂E/∂R_i) * (∂R_i/∂r)
+
+        Args:
+            coords: Atomic coordinates [natoms, 3]
+            charges: Partial charges [natoms]
+            atomic_numbers: Atomic numbers [natoms]
+            box: Simulation box (for PBC)
+
+        Returns:
+            energy: GB electrostatic energy (kcal/mol)
+            forces: COMPLETE Forces [natoms, 3] (kcal/mol/Å)
+        """
+        # Get atomic parameters
+        radii = self.atomic_params.get_radii_array(atomic_numbers)
+        b_params, c_params = self.atomic_params.get_obc_params_arrays(atomic_numbers)
+
+        # Define energy function that includes Born radii calculation
+        def full_energy_fn(x):
+            # Recompute Born radii at new coordinates
+            born_radii_x = self._compute_born_radii_jax(x, radii, b_params, c_params, box)
+            # Compute GB energy with those Born radii
+            return self._gb_energy_only(x, charges, born_radii_x, box)
+
+        # Compute energy and forces via autodiff
+        energy = full_energy_fn(coords)
+        forces = -jax.grad(full_energy_fn)(coords)  # F = -dE/dr (COMPLETE!)
 
         return energy, forces
 
@@ -323,7 +368,7 @@ class GeneralizedBorn(ImplicitSolventModel):
         self,
         coords: jnp.ndarray,
         radii: jnp.ndarray,
-        born_radii: jnp.ndarray,
+        atomic_numbers: jnp.ndarray,
         gammas: jnp.ndarray,
         box: Optional[jnp.ndarray] = None
     ) -> Tuple[float, jnp.ndarray]:
@@ -335,7 +380,7 @@ class GeneralizedBorn(ImplicitSolventModel):
         Args:
             coords: Atomic coordinates [natoms, 3]
             radii: Intrinsic radii [natoms]
-            born_radii: Born radii [natoms]
+            atomic_numbers: Atomic numbers [natoms]
             gammas: Surface tension coefficients [natoms]
             box: Simulation box
 
@@ -343,25 +388,26 @@ class GeneralizedBorn(ImplicitSolventModel):
             energy: Non-polar energy (kcal/mol)
             forces: Forces [natoms, 3] (kcal/mol/Å)
         """
+        # Get OBC parameters for Born radii calculation
+        b_params, c_params = self.atomic_params.get_obc_params_arrays(atomic_numbers)
+
+        # Compute Born radii at current coordinates
+        born_radii = self._compute_born_radii_jax(coords, radii, b_params, c_params, box)
+
         # Simple approximation: Surface area proportional to Born radius squared
         # More sophisticated: LCPO or numerical surface area calculation
-
         surface_area = 4.0 * jnp.pi * (born_radii + self.probe_radius)**2
 
         # Non-polar energy: E_np = Σᵢ γᵢ * SA_i
         energy = jnp.sum(gammas * surface_area)
 
-        # Forces via autodiff
-        energy_fn = lambda x: jnp.sum(
-            gammas * 4.0 * jnp.pi * (
-                self._compute_born_radii_jax(x, radii, jnp.zeros_like(radii), jnp.zeros_like(radii), box) +
-                self.probe_radius
-            )**2
-        )
+        # Forces via autodiff (includes Born radii derivatives)
+        def energy_fn(x):
+            born_radii_x = self._compute_born_radii_jax(x, radii, b_params, c_params, box)
+            surface_area_x = 4.0 * jnp.pi * (born_radii_x + self.probe_radius)**2
+            return jnp.sum(gammas * surface_area_x)
 
-        # For now, use zero forces (surface area term is small)
-        # Full implementation would compute dSA/dr via numerical methods
-        forces = jnp.zeros_like(coords)
+        forces = -jax.grad(energy_fn)(coords)
 
         return energy, forces
 
@@ -371,7 +417,7 @@ class GeneralizedBorn(ImplicitSolventModel):
         charges: jnp.ndarray,
         atomic_numbers: jnp.ndarray
     ) -> Tuple[float, jnp.ndarray]:
-        """CUDA implementation using native CUDA kernels."""
+        """CUDA implementation using native CUDA kernels with COMPLETE forces."""
         try:
             from fennol import cuda as fennol_cuda
             import numpy as np
@@ -385,8 +431,8 @@ class GeneralizedBorn(ImplicitSolventModel):
             radii = self.atomic_params.get_radii_array(atomic_numbers_np)
             b_params, c_params = self.atomic_params.get_obc_params_arrays(atomic_numbers_np)
 
-            # Step 1: Compute Born radii using CUDA
-            born_radii = fennol_cuda.gb_compute_born_radii(
+            # Step 1: Compute Born radii WITH psi_sum (needed for accurate forces)
+            born_radii, psi_sum = fennol_cuda.gb_compute_born_radii_with_psi(
                 coords_np,
                 radii,
                 b_params,
@@ -394,11 +440,16 @@ class GeneralizedBorn(ImplicitSolventModel):
                 self.cutoff
             )
 
-            # Step 2: Compute GB electrostatic energy and forces
-            gb_energy_array, gb_forces = fennol_cuda.gb_compute_energy_forces(
+            # Step 2: Compute GB electrostatic energy and COMPLETE forces
+            # (includes Born radii derivative contributions!)
+            gb_energy_array, gb_forces = fennol_cuda.gb_compute_forces_complete(
                 coords_np,
                 charges_np,
                 born_radii,
+                radii,  # intrinsic radii
+                b_params,
+                c_params,
+                psi_sum,
                 self.dielectric,
                 self.cutoff
             )

@@ -226,6 +226,83 @@ def gb_compute_energy_forces(
     return fennol_cuda.gb_compute_energy_forces(coords, q, radii, dielectric, cutoff)
 
 
+def gb_compute_born_radii_with_psi(
+    coordinates: np.ndarray,
+    intrinsic_radii: np.ndarray,
+    b_params: np.ndarray,
+    c_params: np.ndarray,
+    cutoff: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute Born radii AND return descreening sum (needed for accurate forces).
+
+    Args:
+        coordinates: (natoms, 3) atomic coordinates
+        intrinsic_radii: (natoms,) intrinsic atomic radii
+        b_params: (natoms,) OBC b parameters
+        c_params: (natoms,) OBC c parameters
+        cutoff: cutoff distance
+
+    Returns:
+        Tuple of (born_radii, psi_sum)
+    """
+    if not CUDA_AVAILABLE:
+        raise RuntimeError("CUDA kernels not available")
+
+    coords = np.ascontiguousarray(coordinates, dtype=np.float64)
+    radii = np.ascontiguousarray(intrinsic_radii, dtype=np.float64)
+    b = np.ascontiguousarray(b_params, dtype=np.float64)
+    c = np.ascontiguousarray(c_params, dtype=np.float64)
+
+    return fennol_cuda.gb_compute_born_radii_with_psi(coords, radii, b, c, cutoff)
+
+
+def gb_compute_forces_complete(
+    coordinates: np.ndarray,
+    charges: np.ndarray,
+    born_radii: np.ndarray,
+    intrinsic_radii: np.ndarray,
+    b_params: np.ndarray,
+    c_params: np.ndarray,
+    psi_sum: np.ndarray,
+    dielectric: float,
+    cutoff: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute COMPLETE GB forces including Born radii derivatives (CORRECT VERSION!).
+
+    This includes the full chain rule: dE/dx = ∂E/∂x + ∂E/∂R · dR/dx
+
+    Args:
+        coordinates: (natoms, 3) atomic coordinates
+        charges: (natoms,) partial charges
+        born_radii: (natoms,) Born radii
+        intrinsic_radii: (natoms,) intrinsic atomic radii
+        b_params: (natoms,) OBC b parameters
+        c_params: (natoms,) OBC c parameters
+        psi_sum: (natoms,) descreening sum (from gb_compute_born_radii_with_psi)
+        dielectric: solvent dielectric constant
+        cutoff: cutoff distance
+
+    Returns:
+        Tuple of (energy, forces)
+    """
+    if not CUDA_AVAILABLE:
+        raise RuntimeError("CUDA kernels not available")
+
+    coords = np.ascontiguousarray(coordinates, dtype=np.float64)
+    q = np.ascontiguousarray(charges, dtype=np.float64)
+    radii = np.ascontiguousarray(born_radii, dtype=np.float64)
+    intrinsic = np.ascontiguousarray(intrinsic_radii, dtype=np.float64)
+    b = np.ascontiguousarray(b_params, dtype=np.float64)
+    c = np.ascontiguousarray(c_params, dtype=np.float64)
+    psi = np.ascontiguousarray(psi_sum, dtype=np.float64)
+
+    return fennol_cuda.gb_compute_forces_complete(
+        coords, q, radii, intrinsic, b, c, psi, dielectric, cutoff
+    )
+
+
 def gb_compute_nonpolar(
     coordinates: np.ndarray,
     born_radii: np.ndarray,
