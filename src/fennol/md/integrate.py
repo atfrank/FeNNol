@@ -229,16 +229,51 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
             import numpy as np
             charges = np.array(charges_input, dtype=fprec)
         elif species is not None:
-            # Compute AM1-BCC or assign default charges based on atom type
+            # Assign default charges based on atom type
+            # For proteins, use simple charge estimates:
+            # N: -0.3, O: -0.5, H: +0.3, C: +0.1, S: 0.0
             # For water: O=-0.834, H=+0.417
             import numpy as np
             charges = np.zeros(len(species), dtype=fprec)
-            for i, atom_num in enumerate(species):
-                if atom_num == 8:  # Oxygen
-                    charges[i] = -0.834
-                elif atom_num == 1:  # Hydrogen
-                    charges[i] = +0.417
-                # Add more atom types as needed
+
+            # Count atom types to detect if this is water or protein
+            # Convert JAX array to numpy for counting
+            species_np = np.array(species) if hasattr(species, '__array__') else species
+            atom_counts = {}
+            for atom_num in species_np:
+                atom_num_int = int(atom_num)
+                atom_counts[atom_num_int] = atom_counts.get(atom_num_int, 0) + 1
+
+            # Check if this looks like water (mostly H and O)
+            is_water = (1 in atom_counts and 8 in atom_counts and
+                       len(atom_counts) <= 2 and atom_counts.get(1, 0) > atom_counts.get(8, 0))
+
+            for i, atom_num in enumerate(species_np):
+                atom_num_int = int(atom_num)
+                if is_water:
+                    # Water charges (TIP3P)
+                    if atom_num_int == 8:  # Oxygen
+                        charges[i] = -0.834
+                    elif atom_num_int == 1:  # Hydrogen
+                        charges[i] = +0.417
+                else:
+                    # Protein/general organic molecule charges (simple estimate)
+                    if atom_num_int == 7:  # Nitrogen
+                        charges[i] = -0.3
+                    elif atom_num_int == 8:  # Oxygen
+                        charges[i] = -0.5
+                    elif atom_num_int == 1:  # Hydrogen
+                        charges[i] = +0.3
+                    elif atom_num_int == 6:  # Carbon
+                        charges[i] = +0.1
+                    elif atom_num_int == 16:  # Sulfur
+                        charges[i] = 0.0
+                    # Other atoms default to 0.0
+
+            # Normalize to ensure charge neutrality
+            net_charge = charges.sum()
+            if abs(net_charge) > 1e-6:
+                charges -= net_charge / len(charges)
         else:
             charges = None
 

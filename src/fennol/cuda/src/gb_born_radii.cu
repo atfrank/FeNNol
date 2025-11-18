@@ -246,16 +246,23 @@ __global__ void compute_born_radii_kernel(
     double b = b_params[i];
     double c = c_params[i];
 
+    // CRITICAL: OpenMM scales the descreening sum by 0.5*rho before applying tanh!
+    // This matches ReferenceObc.cpp line 207: sum *= 0.5*offsetRadiusI;
+    double psi_scaled = 0.5 * rho * psi;
+
     // OBC formula: 1/R_i = 1/ρ_i - tanh(ψ - b*ψ² + c*ψ³) / ρ_i
-    double psi_2 = psi * psi;
-    double psi_3 = psi_2 * psi;
-    double tanh_arg = psi - b * psi_2 + c * psi_3;
+    // where ψ is the SCALED descreening sum
+    double psi_2 = psi_scaled * psi_scaled;
+    double psi_3 = psi_2 * psi_scaled;
+    double tanh_arg = psi_scaled - b * psi_2 + c * psi_3;
     double tanh_val = tanh(tanh_arg);
 
     double R_inv = 1.0 / rho - tanh_val / rho;
 
-    // Ensure Born radius is at least as large as intrinsic radius
+    // Convert to Born radius
     double R = 1.0 / R_inv;
+
+    // Ensure Born radius is at least as large as intrinsic radius
     if (R < rho) {
         R = rho;
     }

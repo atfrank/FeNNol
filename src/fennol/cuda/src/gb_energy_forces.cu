@@ -233,10 +233,11 @@ __global__ void compute_gb_pairwise_kernel_tiled(
                 double E_pair = 0.5 * gb_factor * qi * qj / f_gb;
                 E_i += E_pair;
 
-                // Force magnitude (also multiply by 0.5 to avoid double-counting)
-                // Each pair (i,j) is processed by both thread i and thread j,
-                // so we need 0.5 factor just like energy
-                double force_mag = 0.5 * gb_factor * qi * qj * df_gb_dr / (f_gb * f_gb);
+                // Force magnitude (NO 0.5 factor here!)
+                // Each thread computes full force for atom i from all neighbors j
+                // The pair (i,j) is visited twice: once by thread i, once by thread j
+                // Each gets the correct force magnitude without needing to divide by 2
+                double force_mag = gb_factor * qi * qj * df_gb_dr / (f_gb * f_gb);
 
                 // Force components (displacement vector is i - j)
                 double fx = force_mag * dx / r;

@@ -206,6 +206,9 @@ def initialize_preprocessing(simulation_parameters, model, conformation, system_
             stnew["nblist_mult_size"] = simulation_parameters["nblist_mult_size"]
         if "nblist_add_neigh" in simulation_parameters:
             stnew["add_neigh"] = simulation_parameters["nblist_add_neigh"]
+            # Also update max_neigh if it exists (for angle layers)
+            if "max_neigh" in stnew:
+                stnew["max_neigh"] = simulation_parameters["nblist_add_neigh"]
         layer_state.append(freeze(stnew))
     preproc_state["layers_state"] = layer_state
     preproc_state = freeze(preproc_state)

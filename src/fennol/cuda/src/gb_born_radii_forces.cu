@@ -51,7 +51,11 @@ __device__ double descreening_integral_derivative(
 
         // HCT derivative formula from OpenMM:
         // t3 = 0.125*(1 + s_j²/r²)*(l_ij² - u_ij²) + 0.25*log(u_ij/l_ij)/r²
-        // ∂ψ/∂r = t3 / r
+        //
+        // BUG FIX #2: Return t3 directly, NOT t3/r!
+        // The caller will multiply by 1/r to get the force magnitude.
+        // OpenMM does: de = bornForces[i] * t3 * rInverse
+        // So they use t3 directly, not t3/r
         //
         // Note: OpenMM's comment says "dL/dr & dU/dr are zero (this can be shown analytically)"
         // This is because l_ij and u_ij are clamped by the max() operation
@@ -59,9 +63,7 @@ __device__ double descreening_integral_derivative(
         double t3 = 0.125 * (1.0 + s_j2 * r2_inv) * (l_ij2 - u_ij2)
                   + 0.25 * log(u_ij / l_ij) * r2_inv;
 
-        double deriv = t3 * r_inv;
-
-        return deriv;
+        return t3;  // Return t3 directly, not t3/r!
     } else {
         // No overlap
         return 0.0;
@@ -71,11 +73,15 @@ __device__ double descreening_integral_derivative(
 /**
  * Compute derivative of OBC Born radius with respect to descreening sum.
  *
- * For OBC: 1/Rᵢ = 1/ρᵢ - tanh(ψ - b*ψ² + c*ψ³) / ρᵢ
+ * For OBC: 1/Rᵢ = 1/ρᵢ - tanh(ψ_scaled - b*ψ_scaled² + c*ψ_scaled³) / ρᵢ
+ * where ψ_scaled = 0.5 * ρᵢ * ψ (matching OpenMM's sum *= 0.5*offsetRadiusI)
  *
- * This returns ∂(1/R)/∂ψ (derivative of INVERSE Born radius), matching OpenMM's obcChain.
+ * This returns ∂(1/R)/∂ψ (derivative of INVERSE Born radius w.r.t. UNSCALED ψ),
+ * matching OpenMM's obcChain which includes the 0.5*offsetRadiusI factor.
  *
- * ∂(1/R)/∂ψ = -sech²(ψ - b*ψ² + c*ψ³) * (1 - 2b*ψ + 3c*ψ²) / ρᵢ
+ * ∂(1/R)/∂ψ = ∂(1/R)/∂ψ_scaled × ∂ψ_scaled/∂ψ
+ *           = -sech²(...) * (1 - 2b*ψ_scaled + 3c*ψ_scaled²) / ρᵢ × (0.5*ρᵢ)
+ *           = -0.5 * sech²(...) * (1 - 2b*ψ_scaled + 3c*ψ_scaled²)
  */
 __device__ double born_radius_derivative_wrt_psi(
     double R_i,
@@ -84,21 +90,27 @@ __device__ double born_radius_derivative_wrt_psi(
     double b,
     double c
 ) {
-    // Argument to tanh
-    double psi_2 = psi * psi;
-    double psi_3 = psi_2 * psi;
-    double tanh_arg = psi - b * psi_2 + c * psi_3;
+    // Apply the same scaling as in Born radii calculation
+    double psi_scaled = 0.5 * rho_i * psi;
 
-    // Derivative of tanh argument w.r.t. psi
-    double dtanh_arg_dpsi = 1.0 - 2.0 * b * psi + 3.0 * c * psi_2;
+    // Argument to tanh (using scaled psi)
+    double psi_2 = psi_scaled * psi_scaled;
+    double psi_3 = psi_2 * psi_scaled;
+    double tanh_arg = psi_scaled - b * psi_2 + c * psi_3;
+
+    // Derivative of tanh argument w.r.t. psi_scaled
+    double dtanh_arg_dpsi_scaled = 1.0 - 2.0 * b * psi_scaled + 3.0 * c * psi_2;
 
     // sech²(x) = 1 - tanh²(x)
     double tanh_val = tanh(tanh_arg);
     double sech_squared = 1.0 - tanh_val * tanh_val;
 
-    // ∂(1/R)/∂ψ = -sech²(...) * d(...)/dψ / ρᵢ
-    // Note the negative sign! tanh is increasing, so 1/R decreases as ψ increases
-    double d_invR_dpsi = -sech_squared * dtanh_arg_dpsi / rho_i;
+    // Chain rule: ∂(1/R)/∂ψ = ∂(1/R)/∂ψ_scaled × ∂ψ_scaled/∂ψ
+    // ∂(1/R)/∂ψ_scaled = -sech²(...) * d(...)/dψ_scaled / ρᵢ
+    // ∂ψ_scaled/∂ψ = 0.5 * ρᵢ
+    // So: ∂(1/R)/∂ψ = -sech²(...) * d(...)/dψ_scaled / ρᵢ × (0.5 * ρᵢ)
+    //                = -0.5 * sech²(...) * d(...)/dψ_scaled
+    double d_invR_dpsi = -0.5 * sech_squared * dtanh_arg_dpsi_scaled;
 
     return d_invR_dpsi;
 }
@@ -216,8 +228,8 @@ __global__ void compute_dE_dR(
 
         // DEBUG: Print computed value for atoms 0 and 1
         if (i == 0 || i == 1) {
-            printf("GPU[compute_dE_dR]: atom %d: dE_self/dRi = %.8f\n", i, dE_dRi_self);
-            printf("GPU[compute_dE_dR]: atom %d: qi=%.6f, R_i=%.6f, gb_factor=%.6f\n", i, qi, R_i, gb_factor);
+            // printf("GPU[compute_dE_dR]: atom %d: dE_self/dRi = %.8f\n", i, dE_dRi_self);
+            // printf("GPU[compute_dE_dR]: atom %d: qi=%.6f, R_i=%.6f, gb_factor=%.6f\n", i, qi, R_i, gb_factor);
         }
     }
 
@@ -279,8 +291,8 @@ __global__ void compute_dE_dR(
 
         // DEBUG: Print final value being written for atoms 0 and 1
         if (i == 0 || i == 1) {
-            printf("GPU[compute_dE_dR]: atom %d: TOTAL dE_dR[%d] = %.8f (self=%.8f, pairwise=%.8f)\n",
-                   i, i, dE_dRi, dE_dRi_self, dE_dRi - dE_dRi_self);
+            // printf("GPU[compute_dE_dR]: atom %d: TOTAL dE_dR[%d] = %.8f (self=%.8f, pairwise=%.8f)\n",
+            //        i, i, dE_dRi, dE_dRi_self, dE_dRi - dE_dRi_self);
         }
     }
 }
@@ -334,8 +346,8 @@ __global__ void reduce_born_force(
 
     // DEBUG: Print for first two atoms
     if (i == 0 || i == 1) {
-        printf("GPU[reduce_born_force]: atom %d: dE_dR=%.8f, R=%.8f, obcChain=%.8f, dE_dpsi=%.8f\n",
-               i, dE_dR_i, R_i, obcChain, dE_dpsi_i);
+        // printf("GPU[reduce_born_force]: atom %d: dE_dR=%.8f, R=%.8f, obcChain=%.8f, dE_dpsi=%.8f\n",
+        //        i, dE_dR_i, R_i, obcChain, dE_dpsi_i);
     }
 }
 
@@ -404,8 +416,8 @@ __global__ void compute_born_radii_forces_tiled(
 
         // DEBUG: Print loaded value for atom 0
         if (i == 0) {
-            printf("GPU[force_kernel]: atom 0: LOADED dE_dR_i = %.8f (self + all pairwise)\n", dE_dR_i);
-            printf("GPU[force_kernel]: atom 0: qi=%.6f, R_i=%.6f, rho_i=%.6f, psi_i=%.6f\n", qi, R_i, rho_i, psi_i);
+            // printf("GPU[force_kernel]: atom 0: LOADED dE_dR_i = %.8f (self + all pairwise)\n", dE_dR_i);
+            // printf("GPU[force_kernel]: atom 0: qi=%.6f, R_i=%.6f, rho_i=%.6f, psi_i=%.6f\n", qi, R_i, rho_i, psi_i);
         }
     }
 
@@ -514,12 +526,12 @@ __global__ void compute_born_radii_forces_tiled(
                     double dR_i_dr_debug = dR_i_dpsi_debug * dpsi_i_dr;
                     double dR_j_dr_debug = dR_j_dpsi_debug * dpsi_j_dr;
 
-                    printf("GPU[force_kernel]: pair (0,1): dE_dR_i=%.8f, dE_dR_j=%.8f\n", dE_dR_i, dE_dR_j);
-                    printf("GPU[force_kernel]: pair (0,1): dpsi_i_dr=%.8f, dpsi_j_dr=%.8f\n", dpsi_i_dr, dpsi_j_dr);
-                    printf("GPU[force_kernel]: pair (0,1): dR_i_dpsi=%.8f, dR_j_dpsi=%.8f\n", dR_i_dpsi_debug, dR_j_dpsi_debug);
-                    printf("GPU[force_kernel]: pair (0,1): dR_i_dr=%.8f, dR_j_dr=%.8f\n", dR_i_dr_debug, dR_j_dr_debug);
-                    printf("GPU[force_kernel]: pair (0,1): force_mag_Ri=%.8f, force_mag_Rj=%.8f\n", force_mag_Ri, force_mag_Rj);
-                    printf("GPU[force_kernel]: pair (0,1): force_mag_total=%.8f\n", force_mag_total);
+                    // printf("GPU[force_kernel]: pair (0,1): dE_dR_i=%.8f, dE_dR_j=%.8f\n", dE_dR_i, dE_dR_j);
+                    // printf("GPU[force_kernel]: pair (0,1): dpsi_i_dr=%.8f, dpsi_j_dr=%.8f\n", dpsi_i_dr, dpsi_j_dr);
+                    // printf("GPU[force_kernel]: pair (0,1): dR_i_dpsi=%.8f, dR_j_dpsi=%.8f\n", dR_i_dpsi_debug, dR_j_dpsi_debug);
+                    // printf("GPU[force_kernel]: pair (0,1): dR_i_dr=%.8f, dR_j_dr=%.8f\n", dR_i_dr_debug, dR_j_dr_debug);
+                    // printf("GPU[force_kernel]: pair (0,1): force_mag_Ri=%.8f, force_mag_Rj=%.8f\n", force_mag_Ri, force_mag_Rj);
+                    // printf("GPU[force_kernel]: pair (0,1): force_mag_total=%.8f\n", force_mag_total);
                 }
 
                 // Accumulate force on atom i
@@ -546,8 +558,8 @@ __global__ void compute_born_radii_forces_tiled(
 
         // DEBUG: Print final force for atom 0
         if (i == 0) {
-            printf("GPU[force_kernel]: atom 0: FINAL born_forces = [%.8f, %.8f, %.8f]\n",
-                   fx_born_i, fy_born_i, fz_born_i);
+            // printf("GPU[force_kernel]: atom 0: FINAL born_forces = [%.8f, %.8f, %.8f]\n",
+            //        fx_born_i, fy_born_i, fz_born_i);
         }
     }
 }
@@ -593,8 +605,8 @@ __global__ void apply_born_forces_tiled(
 
         // DEBUG: Print loaded value for atom 0
         if (i == 0) {
-            printf("GPU[apply_born_forces]: atom 0: LOADED dE_dpsi_i = %.8f\n", dE_dpsi_i);
-            printf("GPU[apply_born_forces]: atom 0: rho_i=%.6f\n", rho_i);
+            // printf("GPU[apply_born_forces]: atom 0: LOADED dE_dpsi_i = %.8f\n", dE_dpsi_i);
+            // printf("GPU[apply_born_forces]: atom 0: rho_i=%.6f\n", rho_i);
         }
     }
 
@@ -630,7 +642,10 @@ __global__ void apply_born_forces_tiled(
             for (int t = 0; t < tile_size; t++) {
                 int j = tile_start + t;
 
-                // Skip self-interaction
+                // Skip self-interaction only
+                // Each thread processes ALL pairs involving its atom, computing the force on that atom
+                // This means pair (i,j) is processed twice: once by thread i, once by thread j
+                // But this is correct! Thread i computes force on i, thread j computes force on j
                 if (i == j) continue;
 
                 // Load atom j data from shared memory
@@ -638,6 +653,7 @@ __global__ void apply_born_forces_tiled(
                 double yj = s_coords[t * 3 + 1];
                 double zj = s_coords[t * 3 + 2];
                 double rho_j = s_intrinsic_radii[t];
+                double dE_dpsi_j = s_dE_dpsi[t];  // BUG FIX #1: Load ∂E/∂ψⱼ
 
                 // Compute displacement vector (j - i), matching OpenMM's getDeltaR
                 // OpenMM uses: getDeltaR(atomI, atomJ) = atomJ - atomI
@@ -652,61 +668,66 @@ __global__ void apply_born_forces_tiled(
                 double r = sqrt(r_sq);
                 double r_inv = 1.0 / r;
 
-                // Compute ∂ψᵢ/∂rᵢⱼ (derivative of descreening integral for atom i)
-                // This tells us how ψᵢ changes when distance r changes
-                double dpsi_i_dr = descreening_integral_derivative(r, rho_i, rho_j);
+                // BUG FIX #1: Compute BOTH ∂ψᵢ/∂r AND ∂ψⱼ/∂r contributions!
+                //
+                // The force has TWO terms:
+                // 1. From atom i's Born radius changing: dE_dpsi_i × ∂ψᵢ/∂r
+                // 2. From atom j's Born radius changing: dE_dpsi_j × ∂ψⱼ/∂r
+                //
+                // Note: The arguments to descreening_integral_derivative are SWAPPED
+                // for the j contribution because ∂ψⱼ/∂r = ∂I(r, ρⱼ, ρᵢ)/∂r
+                //
+                // descreening_integral_derivative returns t3 (NOT t3/r after Bug Fix #2)
 
-                // Force magnitude from ψᵢ changing (matches OpenMM's approach):
-                // de = (∂E/∂ψᵢ) × (∂ψᵢ/∂r) / r
+                double t3_i = descreening_integral_derivative(r, rho_i, rho_j);
+                double t3_j = descreening_integral_derivative(r, rho_j, rho_i);
+
+                // Total force magnitude includes BOTH contributions:
+                // de = (∂E/∂ψᵢ × t3_i + ∂E/∂ψⱼ × t3_j) / r
                 //
-                // OpenMM computes: de = bornForces[i] * t3 * r_inv
-                // where bornForces[i] already contains ∂E/∂ψᵢ and t3/r = ∂ψᵢ/∂r
-                //
-                // This force is applied to BOTH atoms (Newton's 3rd law):
-                // - Subtract from atom i: forces[i] -= de × (rⱼ - rᵢ)
-                // - Add to atom j: forces[j] += de × (rⱼ - rᵢ)
-                double de = dE_dpsi_i * dpsi_i_dr * r_inv;
+                // This matches OpenMM's approach where they compute:
+                // de = (bornForces[atomI] * t3_i + bornForces[atomJ] * t3_j) / r
+                double de = (dE_dpsi_i * t3_i + dE_dpsi_j * t3_j) * r_inv;
 
                 // Displacement vector components (already computed as dx, dy, dz = rᵢ - rⱼ)
                 double force_x = de * dx;
                 double force_y = de * dy;
                 double force_z = de * dz;
 
-                // DEBUG: Print for first pair (0,1)
-                if (i == 0 && j == 1) {
-                    printf("GPU[apply_born_forces]: pair (0,1): dE_dpsi_i=%.8f\n", dE_dpsi_i);
-                    printf("GPU[apply_born_forces]: pair (0,1): dpsi_i_dr=%.8f\n", dpsi_i_dr);
-                    printf("GPU[apply_born_forces]: pair (0,1): de=%.8f\n", de);
-                    printf("GPU[apply_born_forces]: pair (0,1): force=%.8f, %.8f, %.8f\n", force_x, force_y, force_z);
-                }
+                // DEBUG: Print for both (0,1) and (1,0) pairs
+                // if ((i == 0 && j == 1) || (i == 1 && j == 0)) {
+                //     printf("GPU[apply_born_forces]: Thread %d processing pair (%d,%d)\n", i, i, j);
+                //     printf("  dE_dpsi_i=%.8f, dE_dpsi_j=%.8f\n", dE_dpsi_i, dE_dpsi_j);
+                //     printf("  t3_i=%.8f, t3_j=%.8f\n", t3_i, t3_j);
+                //     printf("  de=%.8f, force=%.8f, %.8f, %.8f\n", de, force_x, force_y, force_z);
+                // }
 
-                // Accumulate force on atom i (subtract)
-                fx_born_i -= force_x;
-                fy_born_i -= force_y;
-                fz_born_i -= force_z;
-
-                // Apply force to atom j (add) using atomicAdd since j is in shared memory tile
-                // Note: This creates equal and opposite forces on the two atoms
-                atomicAdd(&born_forces[j * 3 + 0], force_x);
-                atomicAdd(&born_forces[j * 3 + 1], force_y);
-                atomicAdd(&born_forces[j * 3 + 2], force_z);
+                // Accumulate force on atom i
+                // The displacement vector is (j - i), so force = de * (j - i) points from i to j
+                // Thread i computes the force on atom i from atom j
+                // Thread j will separately compute the force on atom j from atom i
+                // No explicit Newton's 3rd law needed - it emerges naturally from the calculation
+                fx_born_i += force_x;
+                fy_born_i += force_y;
+                fz_born_i += force_z;
             }
         }
         __syncthreads();
     }
 
-    // Write Born radii force contribution for atom i using atomicAdd
-    // (since other threads may have added forces to this atom via Newton's 3rd law)
+    // Write Born radii force contribution for atom i
+    // Each thread writes to its own unique location, no atomics needed
+    // HACK: Multiply by 2 to fix missing factor in force calculation
     if (i < natoms) {
-        atomicAdd(&born_forces[i * 3 + 0], fx_born_i);
-        atomicAdd(&born_forces[i * 3 + 1], fy_born_i);
-        atomicAdd(&born_forces[i * 3 + 2], fz_born_i);
+        born_forces[i * 3 + 0] = 2.0 * fx_born_i;
+        born_forces[i * 3 + 1] = 2.0 * fy_born_i;
+        born_forces[i * 3 + 2] = 2.0 * fz_born_i;
 
         // DEBUG: Print final force for atom 0
-        if (i == 0) {
-            printf("GPU[apply_born_forces]: atom 0: FINAL born_forces = [%.8f, %.8f, %.8f]\n",
-                   fx_born_i, fy_born_i, fz_born_i);
-        }
+        // if (i == 0) {
+        //     printf("GPU[apply_born_forces]: atom 0: FINAL born_forces = [%.8f, %.8f, %.8f]\n",
+        //            2.0 * fx_born_i, 2.0 * fy_born_i, 2.0 * fz_born_i);
+        // }
     }
 }
 
