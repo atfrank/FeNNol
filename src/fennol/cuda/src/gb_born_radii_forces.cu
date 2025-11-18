@@ -535,15 +535,12 @@ __global__ void compute_born_radii_forces_tiled(
                 }
 
                 // Accumulate force on atom i
-                // R_i contribution: original sign (worked for 2-atom test)
-                // R_j contribution: OPPOSITE sign (different chain rule direction)
-                fx_born_i += force_mag_Ri * dx * r_inv;
-                fy_born_i += force_mag_Ri * dy * r_inv;
-                fz_born_i += force_mag_Ri * dz * r_inv;
-
-                fx_born_i -= force_mag_Rj * dx * r_inv;
-                fy_born_i -= force_mag_Rj * dy * r_inv;
-                fz_born_i -= force_mag_Rj * dz * r_inv;
+                // Both R_i and R_j contributions have SAME SIGN
+                // force_mag already includes correct sign from -dE_dR * dR_dr
+                // Both terms contribute to force on atom i along r_ij direction
+                fx_born_i += force_mag_total * dx * r_inv;
+                fy_born_i += force_mag_total * dy * r_inv;
+                fz_born_i += force_mag_total * dz * r_inv;
             }
         }
         __syncthreads();
