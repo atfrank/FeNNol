@@ -130,6 +130,27 @@ void compute_nonpolar_sasa(
 );
 
 /**
+ * Compute ∂E/∂R for each atom (OpenMM multi-pass approach, step 2)
+ *
+ * @param natoms Number of atoms
+ * @param coords Atomic coordinates [natoms, 3]
+ * @param charges Partial atomic charges [natoms]
+ * @param born_radii Born radii [natoms]
+ * @param dielectric Solvent dielectric constant
+ * @param cutoff Cutoff distance
+ * @param dE_dR Output: ∂E/∂Rᵢ for each atom [natoms]
+ */
+void compute_dE_dR_host(
+    int natoms,
+    const double* coords,
+    const double* charges,
+    const double* born_radii,
+    double dielectric,
+    double cutoff,
+    double* dE_dR
+);
+
+/**
  * Convert ∂E/∂R to ∂E/∂ψ (OpenMM multi-pass approach, step 3)
  *
  * @param natoms Number of atoms

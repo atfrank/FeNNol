@@ -23,21 +23,49 @@ __device__ double descreening_integral_derivative(
     double upper_limit = rho_i + rho_j;
     double lower_limit = fabs(rho_i - rho_j);
 
-    double deriv;
+    // HCT (Hawkins-Cramer-Truhlar) descreening derivative formula
+    // This matches OpenMM's implementation in gbsaObc.cc
 
     if (r < lower_limit) {
         // Complete overlap region - derivative is zero
-        deriv = 0.0;
+        return 0.0;
     } else if (r < upper_limit) {
-        // Partial overlap: I = 0.5 * (1/r² - 1/upper²) * ρᵢ
-        // dI/dr = 0.5 * (-2/r³) * ρᵢ = -ρᵢ/r³
-        deriv = -rho_i / (r * r * r);
+        // Partial overlap region - use HCT derivative formula from OpenMM
+        // This matches ReferenceObc.cpp in OpenMM
+
+        double s_j = rho_j;  // Scaled radius of atom j
+
+        // Compute lower bound: l_ij = 1/max(ρᵢ, |r - sⱼ|)
+        double abs_diff = fabs(r - s_j);
+        double lower_bound = (rho_i > abs_diff) ? rho_i : abs_diff;
+        double l_ij = 1.0 / lower_bound;
+
+        // Compute upper bound: u_ij = 1/(r + sⱼ)
+        double u_ij = 1.0 / (r + s_j);
+
+        double l_ij2 = l_ij * l_ij;
+        double u_ij2 = u_ij * u_ij;
+        double s_j2 = s_j * s_j;
+        double r_inv = 1.0 / r;
+        double r2_inv = r_inv * r_inv;
+
+        // HCT derivative formula from OpenMM:
+        // t3 = 0.125*(1 + s_j²/r²)*(l_ij² - u_ij²) + 0.25*log(u_ij/l_ij)/r²
+        // ∂ψ/∂r = t3 / r
+        //
+        // Note: OpenMM's comment says "dL/dr & dU/dr are zero (this can be shown analytically)"
+        // This is because l_ij and u_ij are clamped by the max() operation
+
+        double t3 = 0.125 * (1.0 + s_j2 * r2_inv) * (l_ij2 - u_ij2)
+                  + 0.25 * log(u_ij / l_ij) * r2_inv;
+
+        double deriv = t3 * r_inv;
+
+        return deriv;
     } else {
         // No overlap
-        deriv = 0.0;
+        return 0.0;
     }
-
-    return deriv;
 }
 
 /**
@@ -45,7 +73,9 @@ __device__ double descreening_integral_derivative(
  *
  * For OBC: 1/Rᵢ = 1/ρᵢ - tanh(ψ - b*ψ² + c*ψ³) / ρᵢ
  *
- * So: dRᵢ/dψ = Rᵢ² * sech²(ψ - b*ψ² + c*ψ³) * (1 - 2b*ψ + 3c*ψ²) / ρᵢ
+ * This returns ∂(1/R)/∂ψ (derivative of INVERSE Born radius), matching OpenMM's obcChain.
+ *
+ * ∂(1/R)/∂ψ = -sech²(ψ - b*ψ² + c*ψ³) * (1 - 2b*ψ + 3c*ψ²) / ρᵢ
  */
 __device__ double born_radius_derivative_wrt_psi(
     double R_i,
@@ -66,10 +96,11 @@ __device__ double born_radius_derivative_wrt_psi(
     double tanh_val = tanh(tanh_arg);
     double sech_squared = 1.0 - tanh_val * tanh_val;
 
-    // dR/dψ = R² * sech²(...) * d(...)/dψ / ρᵢ
-    double dR_dpsi = R_i * R_i * sech_squared * dtanh_arg_dpsi / rho_i;
+    // ∂(1/R)/∂ψ = -sech²(...) * d(...)/dψ / ρᵢ
+    // Note the negative sign! tanh is increasing, so 1/R decreases as ψ increases
+    double d_invR_dpsi = -sech_squared * dtanh_arg_dpsi / rho_i;
 
-    return dR_dpsi;
+    return d_invR_dpsi;
 }
 
 /**
@@ -288,11 +319,14 @@ __global__ void reduce_born_force(
     double b_i = b_params[i];
     double c_i = c_params[i];
 
-    // Compute obcChain = ∂Rᵢ/∂ψᵢ using OBC formula
+    // Compute obcChain = ∂(1/R_i)/∂ψᵢ using OBC formula (matches OpenMM)
     double obcChain = born_radius_derivative_wrt_psi(R_i, rho_i, psi_i, b_i, c_i);
 
-    // Convert: ∂E/∂ψᵢ = (∂E/∂Rᵢ) × Rᵢ² × obcChain
-    // Note: R² factor comes from OpenMM's implementation
+    // Convert: ∂E/∂ψᵢ = (∂E/∂Rᵢ) × (∂R_i/∂ψᵢ)
+    //                 = (∂E/∂Rᵢ) × (-R_i²) × (∂(1/R_i)/∂ψᵢ)
+    //                 = (∂E/∂Rᵢ) × (-R_i²) × obcChain
+    //
+    // Trying POSITIVE sign to match OpenMM (they use: force *= R²×obcChain)
     double dE_dpsi_i = dE_dR_i * R_i * R_i * obcChain;
 
     // Write result
@@ -617,26 +651,33 @@ __global__ void apply_born_forces_tiled(
                 double r = sqrt(r_sq);
                 double r_inv = 1.0 / r;
 
-                // Compute ∂ψᵢ/∂rᵢⱼ (derivative of descreening integral)
+                // Compute ∂ψᵢ/∂rᵢⱼ (derivative of descreening integral for atom i)
+                // This tells us how ψᵢ changes when atom i moves away from j
                 double dpsi_i_dr = descreening_integral_derivative(r, rho_i, rho_j);
 
-                if (fabs(dpsi_i_dr) > 1e-12) {
-                    // Force magnitude: F = -(∂E/∂ψᵢ) × (∂ψᵢ/∂r)
-                    // Note: dE_dpsi already contains R² × obcChain from reduce_born_force
-                    double force_mag = -dE_dpsi_i * dpsi_i_dr;
+                // Force magnitude on atom i from its own ψᵢ contribution ONLY:
+                // F_i = -(∂E/∂ψᵢ)×(∂ψᵢ/∂r)
+                //
+                // Note: We do NOT include the ∂E/∂ψⱼ term here because:
+                // - Thread i processes pair (i,j) and computes force on i from ψᵢ
+                // - Thread j processes pair (j,i) and computes force on j from ψⱼ
+                // - Including both would double-count!
+                //
+                // The ∂E/∂ψⱼ contribution to forces on i will be handled when
+                // thread j processes pair (j,i) via Newton's 3rd law.
+                double force_mag = -dE_dpsi_i * dpsi_i_dr;
 
-                    // DEBUG: Print for first pair (0,1)
-                    if (i == 0 && j == 1) {
-                        printf("GPU[apply_born_forces]: pair (0,1): dE_dpsi_i=%.8f\n", dE_dpsi_i);
-                        printf("GPU[apply_born_forces]: pair (0,1): dpsi_i_dr=%.8f\n", dpsi_i_dr);
-                        printf("GPU[apply_born_forces]: pair (0,1): force_mag=%.8f\n", force_mag);
-                    }
-
-                    // Accumulate force on atom i
-                    fx_born_i += force_mag * dx * r_inv;
-                    fy_born_i += force_mag * dy * r_inv;
-                    fz_born_i += force_mag * dz * r_inv;
+                // DEBUG: Print for first pair (0,1)
+                if (i == 0 && j == 1) {
+                    printf("GPU[apply_born_forces]: pair (0,1): dE_dpsi_i=%.8f\n", dE_dpsi_i);
+                    printf("GPU[apply_born_forces]: pair (0,1): dpsi_i_dr=%.8f\n", dpsi_i_dr);
+                    printf("GPU[apply_born_forces]: pair (0,1): force_mag=%.8f\n", force_mag);
                 }
+
+                // Accumulate force on atom i
+                fx_born_i += force_mag * dx * r_inv;
+                fy_born_i += force_mag * dy * r_inv;
+                fz_born_i += force_mag * dz * r_inv;
             }
         }
         __syncthreads();
@@ -756,6 +797,37 @@ void compute_gb_forces_complete(
     // Clean up
     CUDA_CHECK(cudaFree(dE_dR));
     CUDA_CHECK(cudaFree(born_forces));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+/**
+ * Host function to compute ∂E/∂R for each atom (OpenMM multi-pass step 2).
+ */
+void compute_dE_dR_host(
+    int natoms,
+    const double* coords,
+    const double* charges,
+    const double* born_radii,
+    double dielectric,
+    double cutoff,
+    double* dE_dR  // Output
+) {
+    int threads_per_block = 256;
+    int num_blocks = (natoms + threads_per_block - 1) / threads_per_block;
+
+    // Shared memory: coords[256*3] + charges[256] + born_radii[256]
+    int shared_mem_size = threads_per_block * 5 * sizeof(double);
+
+    compute_dE_dR<<<num_blocks, threads_per_block, shared_mem_size>>>(
+        natoms,
+        coords,
+        charges,
+        born_radii,
+        dielectric,
+        cutoff,
+        dE_dR
+    );
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 

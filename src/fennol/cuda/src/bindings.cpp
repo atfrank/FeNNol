@@ -823,6 +823,173 @@ py::tuple py_gb_compute_born_radii_with_psi(
     return py::make_tuple(born_radii, psi_sum);
 }
 
+// ===== Multi-Pass GB Force Implementation (OpenMM approach) =====
+
+py::array_t<double> py_compute_dE_dR(
+    py::array_t<double> coordinates,
+    py::array_t<double> charges,
+    py::array_t<double> born_radii,
+    double dielectric,
+    double cutoff
+) {
+    auto coords_buf = coordinates.request();
+    auto charges_buf = charges.request();
+    auto born_radii_buf = born_radii.request();
+
+    // Validate inputs
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+    int natoms = coords_buf.shape[0];
+
+    validate_array_size(charges_buf, natoms, "charges");
+    validate_array_size(born_radii_buf, natoms, "born_radii");
+
+    // Allocate device memory
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<double> d_charges(natoms);
+    CudaMemory<double> d_born_radii(natoms);
+    CudaMemory<double> d_dE_dR(natoms);
+
+    // Copy to device
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_charges.copy_to_device(charges_buf.ptr);
+    d_born_radii.copy_to_device(born_radii_buf.ptr);
+
+    // Call CUDA kernel
+    fennol::cuda::implicit_solvent::compute_dE_dR_host(
+        natoms,
+        d_coords.get(),
+        d_charges.get(),
+        d_born_radii.get(),
+        dielectric,
+        cutoff,
+        d_dE_dR.get()
+    );
+
+    // Create output array
+    auto dE_dR = py::array_t<double>(natoms);
+    auto dE_dR_buf = dE_dR.request();
+
+    // Copy from device
+    d_dE_dR.copy_from_device(dE_dR_buf.ptr);
+
+    return dE_dR;
+}
+
+py::array_t<double> py_reduce_born_force(
+    py::array_t<double> dE_dR,
+    py::array_t<double> born_radii,
+    py::array_t<double> intrinsic_radii,
+    py::array_t<double> b_params,
+    py::array_t<double> c_params,
+    py::array_t<double> psi_sum
+) {
+    auto dE_dR_buf = dE_dR.request();
+    auto born_radii_buf = born_radii.request();
+    auto radii_buf = intrinsic_radii.request();
+    auto b_buf = b_params.request();
+    auto c_buf = c_params.request();
+    auto psi_buf = psi_sum.request();
+
+    // Validate inputs
+    validate_array_ndim(dE_dR_buf, 1, "dE_dR");
+    int natoms = dE_dR_buf.shape[0];
+
+    validate_array_size(born_radii_buf, natoms, "born_radii");
+    validate_array_size(radii_buf, natoms, "intrinsic_radii");
+    validate_array_size(b_buf, natoms, "b_params");
+    validate_array_size(c_buf, natoms, "c_params");
+    validate_array_size(psi_buf, natoms, "psi_sum");
+
+    // Allocate device memory
+    CudaMemory<double> d_dE_dR(natoms);
+    CudaMemory<double> d_born_radii(natoms);
+    CudaMemory<double> d_radii(natoms);
+    CudaMemory<double> d_b_params(natoms);
+    CudaMemory<double> d_c_params(natoms);
+    CudaMemory<double> d_psi_sum(natoms);
+    CudaMemory<double> d_dE_dpsi(natoms);
+
+    // Copy to device
+    d_dE_dR.copy_to_device(dE_dR_buf.ptr);
+    d_born_radii.copy_to_device(born_radii_buf.ptr);
+    d_radii.copy_to_device(radii_buf.ptr);
+    d_b_params.copy_to_device(b_buf.ptr);
+    d_c_params.copy_to_device(c_buf.ptr);
+    d_psi_sum.copy_to_device(psi_buf.ptr);
+
+    // Call CUDA kernel
+    fennol::cuda::implicit_solvent::reduce_born_force_host(
+        natoms,
+        d_dE_dR.get(),
+        d_born_radii.get(),
+        d_radii.get(),
+        d_b_params.get(),
+        d_c_params.get(),
+        d_psi_sum.get(),
+        d_dE_dpsi.get()
+    );
+
+    // Create output array
+    auto dE_dpsi = py::array_t<double>(natoms);
+    auto dE_dpsi_buf = dE_dpsi.request();
+
+    // Copy from device
+    d_dE_dpsi.copy_from_device(dE_dpsi_buf.ptr);
+
+    return dE_dpsi;
+}
+
+py::array_t<double> py_apply_born_forces(
+    py::array_t<double> coordinates,
+    py::array_t<double> intrinsic_radii,
+    py::array_t<double> dE_dpsi,
+    double cutoff
+) {
+    auto coords_buf = coordinates.request();
+    auto radii_buf = intrinsic_radii.request();
+    auto dE_dpsi_buf = dE_dpsi.request();
+
+    // Validate inputs
+    validate_array_shape_2d(coords_buf, 3, "coordinates");
+    int natoms = coords_buf.shape[0];
+
+    validate_array_size(radii_buf, natoms, "intrinsic_radii");
+    validate_array_size(dE_dpsi_buf, natoms, "dE_dpsi");
+
+    // Allocate device memory
+    CudaMemory<double> d_coords(natoms * 3);
+    CudaMemory<double> d_radii(natoms);
+    CudaMemory<double> d_dE_dpsi(natoms);
+    CudaMemory<double> d_born_forces(natoms * 3);
+
+    // Copy to device
+    d_coords.copy_to_device(coords_buf.ptr);
+    d_radii.copy_to_device(radii_buf.ptr);
+    d_dE_dpsi.copy_to_device(dE_dpsi_buf.ptr);
+
+    // Initialize forces to zero
+    d_born_forces.memset(0);
+
+    // Call CUDA kernel
+    fennol::cuda::implicit_solvent::apply_born_forces_host(
+        natoms,
+        d_coords.get(),
+        d_radii.get(),
+        d_dE_dpsi.get(),
+        cutoff,
+        d_born_forces.get()
+    );
+
+    // Create output array
+    auto born_forces = py::array_t<double>({natoms, 3});
+    auto born_forces_buf = born_forces.request();
+
+    // Copy from device
+    d_born_forces.copy_from_device(born_forces_buf.ptr);
+
+    return born_forces;
+}
+
 py::tuple py_gb_compute_forces_complete(
     py::array_t<double> coordinates,
     py::array_t<double> charges,
@@ -1093,6 +1260,22 @@ PYBIND11_MODULE(fennol_cuda, m) {
           py::arg("coordinates"), py::arg("charges"), py::arg("born_radii"),
           py::arg("intrinsic_radii"), py::arg("b_params"), py::arg("c_params"),
           py::arg("psi_sum"), py::arg("dielectric"), py::arg("cutoff"));
+
+    // Multi-pass GB force functions (OpenMM approach)
+    m.def("compute_dE_dR", &fennol::cuda::py_compute_dE_dR,
+          "Compute ∂E/∂R for each atom (OpenMM multi-pass approach, step 2)",
+          py::arg("coordinates"), py::arg("charges"), py::arg("born_radii"),
+          py::arg("dielectric"), py::arg("cutoff"));
+
+    m.def("reduce_born_force", &fennol::cuda::py_reduce_born_force,
+          "Convert ∂E/∂R to ∂E/∂ψ (OpenMM multi-pass approach, step 3)",
+          py::arg("dE_dR"), py::arg("born_radii"), py::arg("intrinsic_radii"),
+          py::arg("b_params"), py::arg("c_params"), py::arg("psi_sum"));
+
+    m.def("apply_born_forces", &fennol::cuda::py_apply_born_forces,
+          "Apply Born radius forces using ∂E/∂ψ (OpenMM multi-pass approach, step 4)",
+          py::arg("coordinates"), py::arg("intrinsic_radii"), py::arg("dE_dpsi"),
+          py::arg("cutoff"));
 
     // GNN implicit solvent functions
     m.def("gnn_predict_forces", &fennol::cuda::py_gnn_predict_forces,

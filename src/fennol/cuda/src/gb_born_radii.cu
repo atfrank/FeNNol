@@ -25,22 +25,59 @@ __device__ double descreening_integral(
     double upper_limit = rho_i + rho_j;
     double lower_limit = fabs(rho_i - rho_j);
 
-    double integral;
-
     if (r < lower_limit) {
-        // Complete overlap
-        integral = 0.5 * (1.0 / (lower_limit * lower_limit) -
-                         1.0 / (upper_limit * upper_limit));
+        // Complete overlap region
+        // Use same HCT formula but with r = lower_limit
+        double r_clamped = lower_limit;
+        double s_j = rho_j;
+
+        double abs_diff = fabs(r_clamped - s_j);
+        double lower_bound = (rho_i > abs_diff) ? rho_i : abs_diff;
+        double l_ij = 1.0 / lower_bound;
+        double u_ij = 1.0 / (r_clamped + s_j);
+
+        double l_ij2 = l_ij * l_ij;
+        double u_ij2 = u_ij * u_ij;
+        double s_j2 = s_j * s_j;
+        double r_inv = 1.0 / r_clamped;
+        double ratio = log(u_ij / l_ij);
+
+        double term = l_ij - u_ij + 0.25 * r_clamped * (u_ij2 - l_ij2) +
+                     0.5 * r_inv * ratio +
+                     0.25 * s_j2 * r_inv * (l_ij2 - u_ij2);
+
+        return term;
+
     } else if (r < upper_limit) {
-        // Partial overlap
-        integral = 0.5 * (1.0 / (r * r) -
-                         1.0 / (upper_limit * upper_limit));
+        // Partial overlap - use full HCT integral formula (matches OpenMM)
+        double s_j = rho_j;
+
+        // Compute lower bound: l_ij = 1/max(ρᵢ, |r - sⱼ|)
+        double abs_diff = fabs(r - s_j);
+        double lower_bound = (rho_i > abs_diff) ? rho_i : abs_diff;
+        double l_ij = 1.0 / lower_bound;
+
+        // Compute upper bound: u_ij = 1/(r + sⱼ)
+        double u_ij = 1.0 / (r + s_j);
+
+        double l_ij2 = l_ij * l_ij;
+        double u_ij2 = u_ij * u_ij;
+        double s_j2 = s_j * s_j;
+        double r_inv = 1.0 / r;
+        double ratio = log(u_ij / l_ij);
+
+        // HCT integral formula from OpenMM's ReferenceObc.cpp:
+        // term = l_ij - u_ij + 0.25*r*(u_ij² - l_ij²) + 0.5*ln(u_ij/l_ij)/r
+        //        + 0.25*s_j²/r*(l_ij² - u_ij²)
+        double term = l_ij - u_ij + 0.25 * r * (u_ij2 - l_ij2) +
+                     0.5 * r_inv * ratio +
+                     0.25 * s_j2 * r_inv * (l_ij2 - u_ij2);
+
+        return term;
     } else {
         // No overlap
-        integral = 0.0;
+        return 0.0;
     }
-
-    return integral * rho_i;
 }
 
 /**
