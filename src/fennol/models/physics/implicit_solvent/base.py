@@ -34,13 +34,34 @@ class ImplicitSolventModel(ABC):
         self.has_cuda = self._check_cuda_available()
 
     def _check_cuda_available(self) -> bool:
-        """Check if CUDA kernels for this model are available."""
+        """Check if CUDA kernels for this model are available and a CUDA device exists."""
         try:
             from fennol import cuda
             # Check for GB CUDA functions
-            return (hasattr(cuda, "gb_compute_born_radii") and
-                    hasattr(cuda, "gb_compute_energy_forces"))
-        except (ImportError, AttributeError):
+            has_functions = (hasattr(cuda, "gb_compute_born_radii") and
+                           hasattr(cuda, "gb_compute_energy_forces"))
+
+            if not has_functions:
+                return False
+
+            # Also check if a CUDA device is actually available
+            # Try to call a simple CUDA function to see if it works
+            try:
+                import numpy as np
+                # Test with minimal inputs
+                test_coords = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+                test_radii = np.array([1.5], dtype=np.float32)
+                test_b = np.array([0.8], dtype=np.float32)
+                test_c = np.array([0.0], dtype=np.float32)
+                # Try to compute Born radii - this will fail if no CUDA device
+                cuda.gb_compute_born_radii(test_coords, test_radii, test_b, test_c, 8.0)
+                return True
+            except RuntimeError as e:
+                # CUDA device not available
+                if "CUDA" in str(e) or "no CUDA-capable device" in str(e):
+                    return False
+                raise
+        except (ImportError, AttributeError, RuntimeError):
             return False
 
     @abstractmethod

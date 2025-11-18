@@ -258,7 +258,11 @@ def dynamic(simulation_parameters, device, fprec):
     save_keys = simulation_parameters.get("save_keys", [])
     if save_keys:
         print(f"# Saving keys: {save_keys}")
-        fkeys = open(f"{system_name}.traj.pkl", "wb+")
+        import os
+        pkl_file = f"{system_name}.traj.pkl"
+        if os.path.exists(pkl_file):
+            os.remove(pkl_file)
+        fkeys = open(pkl_file, "wb")
     else:
         fkeys = None
 
@@ -279,6 +283,10 @@ def dynamic(simulation_parameters, device, fprec):
         header += "  Temp_c[K]"
     if include_thermostat_energy:
         header += "      Etherm"
+    # Check if GB implicit solvent is enabled
+    has_gb_model = "implicit_solvent" in simulation_parameters
+    if has_gb_model:
+        header += "         EGB"
     if use_restraints:
         header += "   Erestraint"
     if estimate_pressure:
@@ -308,20 +316,35 @@ def dynamic(simulation_parameters, device, fprec):
 
     write_all_beads = simulation_parameters.get("write_all_beads", False) and pimd
 
+    # Delete existing trajectory files to avoid appending to old runs
+    import os
     if write_all_beads:
+        for i in range(nbeads):
+            traj_file = f"{system_name}_bead{i+1:03d}" + traj_ext
+            if os.path.exists(traj_file):
+                os.remove(traj_file)
         fout = [
-            open(f"{system_name}_bead{i+1:03d}" + traj_ext, "a") for i in range(nbeads)
+            open(f"{system_name}_bead{i+1:03d}" + traj_ext, "w") for i in range(nbeads)
         ]
     else:
-        fout = open(system_name + traj_ext, "a")
+        traj_file = system_name + traj_ext
+        if os.path.exists(traj_file):
+            os.remove(traj_file)
+        fout = open(system_name + traj_ext, "w")
 
     ensemble_key = simulation_parameters.get("etot_ensemble_key", None)
     if ensemble_key is not None:
-        fens = open(f"{system_name}.ensemble_weights.traj", "a")
+        ensemble_file = f"{system_name}.ensemble_weights.traj"
+        if os.path.exists(ensemble_file):
+            os.remove(ensemble_file)
+        fens = open(ensemble_file, "w")
 
     write_centroid = simulation_parameters.get("write_centroid", False) and pimd
     if write_centroid:
-        fcentroid = open(f"{system_name}_centroid" + traj_ext, "a")
+        centroid_file = f"{system_name}_centroid" + traj_ext
+        if os.path.exists(centroid_file):
+            os.remove(centroid_file)
+        fcentroid = open(centroid_file, "w")
 
     fcolvars = None
 
@@ -366,6 +389,11 @@ def dynamic(simulation_parameters, device, fprec):
             if has_restraints:
                 restraint_energy = system["restraint_energy"]
 
+            # Track GB solvation energy if present
+            has_gb = "gb_energy" in system
+            if has_gb:
+                gb_energy = system["gb_energy"]
+
             properties_traj[f"Etot[{atom_energy_unit_str}]"].append(
                 etot * atom_energy_unit
             )
@@ -379,6 +407,10 @@ def dynamic(simulation_parameters, device, fprec):
             if has_restraints:
                 properties_traj[f"Erestraint[{atom_energy_unit_str}]"].append(
                     restraint_energy * atom_energy_unit
+                )
+            if has_gb:
+                properties_traj[f"EGB[{atom_energy_unit_str}]"].append(
+                    gb_energy * atom_energy_unit
                 )
             if pimd:
                 ek_c = system["ek_c"]
@@ -395,6 +427,8 @@ def dynamic(simulation_parameters, device, fprec):
                 properties_traj[f"Etherm[{atom_energy_unit_str}]"].append(
                     etherm * atom_energy_unit
                 )
+            if has_gb:
+                line += f"  {gb_energy*atom_energy_unit: #10.4f}"
             if has_restraints:
                 line += f"  {restraint_energy*atom_energy_unit: #10.4f}"
             if estimate_pressure:
