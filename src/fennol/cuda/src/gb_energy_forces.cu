@@ -233,15 +233,20 @@ __global__ void compute_gb_pairwise_kernel_tiled(
                 double E_pair = 0.5 * gb_factor * qi * qj / f_gb;
                 E_i += E_pair;
 
-                // Force magnitude
-                double force_mag = gb_factor * qi * qj * df_gb_dr / (f_gb * f_gb);
+                // Force magnitude (also multiply by 0.5 to avoid double-counting)
+                // Each pair (i,j) is processed by both thread i and thread j,
+                // so we need 0.5 factor just like energy
+                double force_mag = 0.5 * gb_factor * qi * qj * df_gb_dr / (f_gb * f_gb);
 
-                // Force components
+                // Force components (displacement vector is i - j)
                 double fx = force_mag * dx / r;
                 double fy = force_mag * dy / r;
                 double fz = force_mag * dz / r;
 
-                // Accumulate forces on atom i
+                // Accumulate forces on atom i only
+                // Thread i processes (i,j) and adds force to i
+                // Thread j processes (j,i) and adds force to j
+                // This gives Newton's 3rd law automatically with the 0.5 factor
                 fx_i += fx;
                 fy_i += fy;
                 fz_i += fz;
@@ -250,7 +255,7 @@ __global__ void compute_gb_pairwise_kernel_tiled(
         __syncthreads();
     }
 
-    // Write results (no atomics needed except for total energy!)
+    // Write results (no atomics needed for forces since each thread writes its own atom)
     if (i < natoms) {
         forces[i * 3 + 0] = fx_i;
         forces[i * 3 + 1] = fy_i;
@@ -303,8 +308,9 @@ void compute_gb_energy_forces(
     double* energy,
     double* forces
 ) {
-    // Initialize energy to zero
+    // Initialize energy and forces to zero
     CUDA_CHECK(cudaMemset(energy, 0, sizeof(double)));
+    CUDA_CHECK(cudaMemset(forces, 0, natoms * 3 * sizeof(double)));
 
     // Launch configuration
     int threads_per_block = 256;
