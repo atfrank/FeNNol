@@ -292,66 +292,144 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None):
         state = {**state, **qtb_state}
 
     elif thermostat_name in ["ANNEAL", "ANNEALING"]:
-        assert rng_key is not None, "rng_key must be provided for QTB thermostat"
-        assert kT is not None, "kT must be specified for QTB thermostat"
-        assert gamma is not None, "gamma must be specified for QTB thermostat"
+        assert rng_key is not None, "rng_key must be provided for ANNEAL thermostat"
+        assert kT is not None, "kT must be specified for ANNEAL thermostat"
+        assert gamma is not None, "gamma must be specified for ANNEAL thermostat"
         assert nbeads is None, "ANNEAL is not compatible with PIMD"
         a1 = math.exp(-gamma * dt)
-        a2 = jnp.asarray(((1 - a1 * a1) * kT / mass[:, None]) ** 0.5, dtype=fprec)
 
         anneal_parameters = simulation_parameters.get("annealing", {})
-        init_factor = anneal_parameters.get("init_factor", 1.0 / 25.0)
-        assert init_factor > 0.0, "init_factor must be positive"
-        final_factor = anneal_parameters.get("final_factor", 1.0 / 10000.0)
-        assert final_factor > 0.0, "final_factor must be positive"
         nsteps = simulation_parameters.get("nsteps")
-        anneal_steps = anneal_parameters.get("anneal_steps", 1.0)
-        assert (
-            anneal_steps < 1.0 and anneal_steps > 0.0
-        ), "warmup_steps must be between 0 and nsteps"
-        pct_start = anneal_parameters.get("warmup_steps", 0.3)
-        assert (
-            pct_start < 1.0 and pct_start > 0.0
-        ), "warmup_steps must be between 0 and nsteps"
 
-        anneal_type = anneal_parameters.get("type", "cosine").lower()
-        if anneal_type == "linear":
-            schedule = optax.linear_onecycle_schedule(
+        # Support both new intuitive interface and old interface for backward compatibility
+        T_base = kT * au.KELVIN  # Convert to Kelvin
+
+        # New intuitive interface: T_start and T_end in Kelvin
+        if "T_start" in anneal_parameters or "temperature_start" in anneal_parameters:
+            T_start = anneal_parameters.get("T_start", anneal_parameters.get("temperature_start"))
+            T_end = anneal_parameters.get("T_end", anneal_parameters.get("temperature_end", 0.0))
+            assert T_start > 0, "T_start must be positive"
+            assert T_end >= 0, "T_end must be non-negative"
+
+            # Convert to factors relative to base kT
+            init_factor = T_start / T_base
+            final_factor = T_end / T_base if T_end > 0 else 1e-6
+
+            print(f"# ANNEAL: Simulated annealing from {T_start:.1f} K to {T_end:.1f} K")
+        else:
+            # Old interface: init_factor and final_factor (for backward compatibility)
+            init_factor = anneal_parameters.get("init_factor", 2.0)  # Default: 2× base temperature
+            final_factor = anneal_parameters.get("final_factor", 0.01)  # Default: cool to 1% of base
+            assert init_factor > 0.0, "init_factor must be positive"
+            assert final_factor > 0.0, "final_factor must be positive"
+
+            T_start = init_factor * T_base
+            T_end = final_factor * T_base
+            print(f"# ANNEAL: Simulated annealing from {T_start:.1f} K (factor={init_factor:.3f}) "
+                  f"to {T_end:.1f} K (factor={final_factor:.3f})")
+
+        # Annealing schedule parameters
+        anneal_steps_frac = anneal_parameters.get("anneal_steps", 1.0)
+        assert 0.0 < anneal_steps_frac <= 1.0, "anneal_steps must be between 0 and 1"
+        anneal_nsteps = int(anneal_steps_frac * nsteps)
+
+        anneal_type = anneal_parameters.get("schedule", anneal_parameters.get("type", "exponential")).lower()
+
+        # Create temperature schedule based on type
+        if anneal_type in ["linear", "linear_decay"]:
+            # Simple linear decay from T_start to T_end
+            def schedule(step):
+                if step >= anneal_nsteps:
+                    return final_factor
+                progress = step / anneal_nsteps
+                return init_factor * (1.0 - progress) + final_factor * progress
+
+        elif anneal_type in ["exponential", "exp", "exp_decay"]:
+            # Exponential decay: T(t) = T_end + (T_start - T_end) * exp(-t/tau)
+            # At t=anneal_nsteps, we want to reach close to T_end
+            # Using exp(-5) ≈ 0.0067, so we set tau = anneal_nsteps / 5
+            tau = anneal_nsteps / 5.0 if anneal_nsteps > 0 else 1.0
+            def schedule(step):
+                if step >= anneal_nsteps:
+                    return final_factor
+                decay = math.exp(-step / tau)
+                return final_factor + (init_factor - final_factor) * decay
+
+        elif anneal_type in ["cosine", "cosine_decay"]:
+            # Smooth cosine decay from T_start to T_end
+            def schedule(step):
+                if step >= anneal_nsteps:
+                    return final_factor
+                progress = step / anneal_nsteps
+                # Cosine annealing: 0.5 * (1 + cos(π * progress))
+                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return final_factor + (init_factor - final_factor) * cosine_factor
+
+        elif anneal_type in ["cosine_onecycle", "onecycle"]:
+            # Old behavior: heat up then cool down (for backward compatibility)
+            pct_start = anneal_parameters.get("warmup_steps", anneal_parameters.get("pct_start", 0.3))
+            assert 0.0 < pct_start < 1.0, "warmup_steps/pct_start must be between 0 and 1"
+
+            schedule_fn = optax.cosine_onecycle_schedule(
                 peak_value=1.0,
                 div_factor=1.0 / init_factor,
                 final_div_factor=1.0 / final_factor,
-                transition_steps=int(anneal_steps * nsteps),
+                transition_steps=anneal_nsteps,
+                pct_start=pct_start,
+            )
+            schedule = lambda step: schedule_fn(min(step, anneal_nsteps - 1))
+            print(f"# ANNEAL: Using onecycle schedule (warmup={pct_start*100:.0f}%)")
+
+        elif anneal_type in ["linear_onecycle"]:
+            # Linear version of onecycle (for backward compatibility)
+            pct_start = anneal_parameters.get("warmup_steps", anneal_parameters.get("pct_start", 0.3))
+            assert 0.0 < pct_start < 1.0, "warmup_steps/pct_start must be between 0 and 1"
+
+            schedule_fn = optax.linear_onecycle_schedule(
+                peak_value=1.0,
+                div_factor=1.0 / init_factor,
+                final_div_factor=1.0 / final_factor,
+                transition_steps=anneal_nsteps,
                 pct_start=pct_start,
                 pct_final=1.0,
             )
-        elif anneal_type == "cosine_onecycle":
-            schedule = optax.cosine_onecycle_schedule(
-                peak_value=1.0,
-                div_factor=1.0 / init_factor,
-                final_div_factor=1.0 / final_factor,
-                transition_steps=int(anneal_steps * nsteps),
-                pct_start=pct_start,
-            )
+            schedule = lambda step: schedule_fn(min(step, anneal_nsteps - 1))
+            print(f"# ANNEAL: Using linear onecycle schedule (warmup={pct_start*100:.0f}%)")
         else:
-            raise ValueError(f"Unknown anneal_type {anneal_type}")
+            raise ValueError(f"Unknown anneal schedule type: {anneal_type}. "
+                           f"Supported: linear, exponential, cosine, cosine_onecycle, linear_onecycle")
 
+        # Store annealing info for logging
         state["rng_key"] = rng_key
         state["istep_anneal"] = 0
+        state["anneal_nsteps"] = anneal_nsteps
+        state["T_start"] = T_start
+        state["T_end"] = T_end
 
+        # Initialize velocities at starting temperature
         rng_key, v_key = jax.random.split(rng_key)
-        Tscale = schedule(0)
-        print(f"# ANNEAL: initial temperature = {Tscale*kT*au.KELVIN:.3e} K")
+        Tscale_init = schedule(0)
+        kT_init = kT * Tscale_init
+        a2 = jnp.asarray(((1 - a1 * a1) * kT / mass[:, None]) ** 0.5, dtype=fprec)
+
+        print(f"# ANNEAL: Schedule type = {anneal_type}")
+        print(f"# ANNEAL: Annealing over {anneal_nsteps} steps ({anneal_steps_frac*100:.0f}% of simulation)")
+        print(f"# ANNEAL: Initial temperature = {Tscale_init * T_base:.1f} K")
+        print(f"# ANNEAL: Final temperature = {final_factor * T_base:.1f} K")
+
         vel = (
             jax.random.normal(v_key, (mass.shape[0], 3), dtype=fprec)
-            * (kT * Tscale / mass[:, None]) ** 0.5
+            * (kT_init / mass[:, None]) ** 0.5
         )
 
         def thermostat(vel, state):
             rng_key, noise_key = jax.random.split(state["rng_key"])
             noise = jax.random.normal(noise_key, vel.shape, dtype=vel.dtype)
 
+            # Get temperature scale factor at current step
             Tscale = schedule(state["istep_anneal"]) ** 0.5
             vel = a1 * vel + a2 * Tscale * noise
+
             return vel, {
                 **state,
                 "rng_key": rng_key,
