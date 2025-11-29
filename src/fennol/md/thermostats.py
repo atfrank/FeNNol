@@ -43,7 +43,8 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None):
         rng_key, v_key = jax.random.split(rng_key)
         if nbeads is None:
             a1 = math.exp(-gamma * dt)
-            a2 = jnp.asarray(((1 - a1 * a1) * kT / mass[:, None]) ** 0.5, dtype=fprec)
+            a2_factor = jnp.asarray(((1 - a1 * a1) / mass[:, None]) ** 0.5, dtype=fprec)
+            a2 = a2_factor * jnp.sqrt(kT)  # Initial a2
             vel = (
                 jax.random.normal(v_key, (mass.shape[0], 3), dtype=fprec)
                 * (kT / mass[:, None]) ** 0.5
@@ -56,15 +57,19 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None):
             ), "gamma must be a float or a numpy array"
             assert gamma.shape[0] == nbeads, "gamma must have the same length as nbeads"
             a1 = np.exp(-gamma * dt)[:, None, None]
-            a2 = jnp.asarray(
-                ((1 - a1 * a1) * kT / mass[None, :, None]) ** 0.5, dtype=fprec
+            a2_factor = jnp.asarray(
+                ((1 - a1 * a1) / mass[None, :, None]) ** 0.5, dtype=fprec
             )
+            a2 = a2_factor * jnp.sqrt(kT)  # Initial a2
             vel = (
                 jax.random.normal(v_key, (nbeads, mass.shape[0], 3), dtype=fprec)
                 * (kT / mass[:, None]) ** 0.5
             )
 
         state["rng_key"] = rng_key
+        # Store kT and a2_factor for dynamic temperature updates (simulated tempering)
+        state["kT"] = kT
+        state["a2_factor"] = a2_factor
         if compute_thermostat_energy:
             state["thermostat_energy"] = 0.0
         if thermostat_name == "FFLGV":
@@ -75,7 +80,10 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None):
                 dirvel = vel / norm_vel
                 if compute_thermostat_energy:
                     v2 = (vel**2).sum(axis=-1)
-                vel = a1 * vel + a2 * noise
+                # Use dynamic kT from state for simulated tempering support
+                current_kT = state.get("kT", kT)
+                current_a2 = state["a2_factor"] * jnp.sqrt(current_kT)
+                vel = a1 * vel + current_a2 * noise
                 new_norm_vel = jnp.linalg.norm(vel, axis=-1, keepdims=True)
                 vel = dirvel * new_norm_vel
                 new_state = {**state, "rng_key": rng_key}
@@ -88,33 +96,29 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None):
                 return vel, new_state
 
         else:
-            # Optimize Langevin thermostat with vmap for vectorization
-            @partial(jax.jit, static_argnums=(0,))
-            def _update_velocity(self, vel, noise, a1, a2):
-                return a1 * vel + a2 * noise
-            
-            # Vectorize the velocity update calculation
-            _vmap_update_velocity = jax.vmap(_update_velocity, in_axes=(None, 0, 0, None, None), out_axes=0)
-            
-            @jax.jit
+            # Standard Langevin thermostat with dynamic temperature support
             def thermostat(vel, state):
                 rng_key, noise_key = jax.random.split(state["rng_key"])
                 noise = jax.random.normal(noise_key, vel.shape, dtype=vel.dtype)
-                
+
                 if compute_thermostat_energy:
                     v2 = (vel**2).sum(axis=-1)
-                    
-                # Optimize velocity update by applying the calculation vectorized
-                vel = a1 * vel + a2 * noise
-                
+
+                # Use dynamic kT from state for simulated tempering support
+                current_kT = state.get("kT", kT)
+                current_a2 = state["a2_factor"] * jnp.sqrt(current_kT)
+
+                # Velocity update with temperature-dependent noise amplitude
+                vel = a1 * vel + current_a2 * noise
+
                 new_state = {**state, "rng_key": rng_key}
-                
+
                 if compute_thermostat_energy:
                     v2new = (vel**2).sum(axis=-1)
                     new_state["thermostat_energy"] = (
                         state["thermostat_energy"] + 0.5 * (mass * (v2 - v2new)).sum()
                     )
-                    
+
                 return vel, new_state
 
     elif thermostat_name in ["BUSSI"]:

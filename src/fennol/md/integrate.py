@@ -164,7 +164,14 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
         
     ### restraints
     restraints_definitions = simulation_parameters.get("restraints", None)
-    use_restraints = restraints_definitions is not None
+    # Check if restraints should be disabled during MD (even if defined)
+    md_use_restraints = simulation_parameters.get("use_restraints", True)
+    if isinstance(md_use_restraints, str):
+        md_use_restraints = md_use_restraints.lower() in ("yes", "true", "1", "on")
+
+    use_restraints = restraints_definitions is not None and md_use_restraints
+    if restraints_definitions is not None and not md_use_restraints:
+        print("# Restraints defined but disabled for MD (use_restraints = no)")
     if use_restraints:
         # Check if restraint debug is enabled
         restraint_debug = simulation_parameters.get("restraint_debug", False)

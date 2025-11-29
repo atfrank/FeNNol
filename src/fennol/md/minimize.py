@@ -20,6 +20,7 @@ from ..utils.atomic_units import AtomicUnits as au
 from ..utils.input_parser import parse_input
 from .initial import initialize_system
 from .energy_formatter import format_energy_for_display, update_final_energy_display
+from .restraints import setup_restraints, apply_restraints
 
 class Minimizer:
     """Base class for energy minimization algorithms"""
@@ -58,9 +59,29 @@ class Minimizer:
         self.max_step = simulation_parameters.get("min_max_step", 0.2)  # Maximum step size in Angstroms
         self.print_freq = int(simulation_parameters.get("min_print_freq", 10))
         self.history_size = int(simulation_parameters.get("min_history_size", 10))
-        
+
         # Determine output options
         self.output_prefix = system_data["name"]
+
+        # Setup restraints if configured
+        self.use_restraints = simulation_parameters.get("min_use_restraints", False)
+        if isinstance(self.use_restraints, str):
+            self.use_restraints = self.use_restraints.lower() in ("yes", "true", "1", "on")
+
+        self.restraint_forces = []
+        if self.use_restraints:
+            restraints_definitions = simulation_parameters.get("restraints", None)
+            if restraints_definitions is not None:
+                initial_coords = conformation.get("coordinates", None)
+                atom_symbols = system_data.get("symbols", None)
+                _, self.restraint_forces, _ = setup_restraints(
+                    restraints_definitions,
+                    nsteps=None,  # No time-varying during minimization
+                    initial_coordinates=initial_coords,
+                    pdb_data=None,
+                    symbols=atom_symbols
+                )
+                print(f"# Minimization with {len(self.restraint_forces)} restraint(s) enabled")
         
     def _prepare_system(self, coordinates):
         """Helper method to create a system dictionary with the given coordinates"""
@@ -163,7 +184,16 @@ class Minimizer:
         # Scale to atomic units
         epot = epot / self.model_energy_unit
         forces = forces / self.model_energy_unit
-        
+
+        # Apply restraints if enabled
+        if self.use_restraints and len(self.restraint_forces) > 0:
+            restraint_energy, restraint_forces_array = apply_restraints(
+                coordinates, self.restraint_forces, step=0
+            )
+            # Restraint energies are already in atomic units (Hartree)
+            epot = epot + restraint_energy
+            forces = forces + restraint_forces_array
+
         # Convert energy to scalar if it's an array
         if isinstance(epot, jnp.ndarray) and epot.size > 0:
             epot_scalar = epot[0]
@@ -248,25 +278,27 @@ class Minimizer:
         """Print the minimization header"""
         print("#" + "=" * 78)
         print(f"# Starting geometry optimization using {self.__class__.__name__}")
-        
+
         # Get model energy unit and determine if displaying per-atom energy
         energy_unit_str = self.params.get("energy_unit", "kcal/mol")
         per_atom_energy = self.params.get("per_atom_energy", True)
         nat = self.system_data["nat"]
         atom_energy_unit_str = energy_unit_str
-        
+
         if per_atom_energy:
             atom_energy_unit_str = f"{energy_unit_str}/atom"
             print(f"# Energy displayed per atom in {energy_unit_str}/atom")
         else:
             print(f"# Energy displayed in {energy_unit_str}")
-            
+
         print(f"# Number of atoms: {nat}")
         print(f"# Maximum iterations: {self.max_iterations}")
         print(f"# Energy tolerance: {self.energy_tolerance}")
         print(f"# Force tolerance: {self.force_tolerance}")
         print(f"# Displacement tolerance: {self.displacement_tolerance}")
         print(f"# Maximum step size: {self.max_step} Å")
+        if self.use_restraints and len(self.restraint_forces) > 0:
+            print(f"# Restraints: {len(self.restraint_forces)} active")
         print("#" + "=" * 78)
         print(f"# Iter      Energy[{atom_energy_unit_str}]   Max Force     RMS Force      Max Disp      Time/step")
         print("#" + "-" * 78)
@@ -1070,7 +1102,7 @@ class SimpleSteepestDescentMinimizer(Minimizer):
         try:
             # Try with preprocessing first
             updated_conformation = {**self.conformation, "coordinates": coords}
-            
+
             # Use preprocessing if available
             if hasattr(self.model, 'preprocessing') and hasattr(self.model.preprocessing, 'process'):
                 try:
@@ -1083,16 +1115,24 @@ class SimpleSteepestDescentMinimizer(Minimizer):
                 except Exception:
                     # Just continue with unprocessed conformation
                     pass
-            
+
             # Calculate energy and forces
             epot, forces, _ = self.model._energy_and_forces(
                 self.model.variables, updated_conformation
             )
-            
+
             # Scale to atomic units
             epot = epot / self.model_energy_unit
             forces = forces / self.model_energy_unit
-            
+
+            # Apply restraints if enabled
+            if self.use_restraints and len(self.restraint_forces) > 0:
+                restraint_energy, restraint_forces_array = apply_restraints(
+                    coords, self.restraint_forces, step=0
+                )
+                epot = epot + restraint_energy
+                forces = forces + restraint_forces_array
+
             # Return scalar energy value
             if isinstance(epot, jnp.ndarray) and epot.size > 0:
                 return epot[0], forces
