@@ -26,6 +26,7 @@ from .barostats import get_barostat
 from .colvars import setup_colvars
 from .restraints import setup_restraints, apply_restraints
 from .spectra import initialize_ir_spectrum
+from .fixed_atoms import setup_fixed_atoms
 
 from copy import deepcopy
 from .initial import initialize_system
@@ -210,6 +211,23 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
         dyn_state["restraint_metadata"] = restraint_metadata
     else:
         restraint_energies, restraint_forces = {}, []
+
+    ### fixed atoms
+    fixed_atoms_config = simulation_parameters.get("fixed_atoms", None)
+    use_fixed_atoms = fixed_atoms_config is not None
+    if use_fixed_atoms:
+        system_data = setup_fixed_atoms(fixed_atoms_config, system_data, conformation)
+        # Create JAX arrays for mask and reference coordinates
+        mobile_mask_jax = jnp.asarray(~system_data["fixed_mask"], dtype=fprec)[:, None]
+        n_mobile = system_data["n_mobile_atoms"]
+        reference_coords = jnp.asarray(system_data["reference_coordinates"], dtype=fprec)
+    else:
+        mobile_mask_jax = None
+        n_mobile = nat
+        reference_coords = None
+
+    # Store mobile atom count in dyn_state for temperature calculation
+    dyn_state["n_mobile_atoms"] = n_mobile
 
     ### Implicit solvent (GB)
     gb_model = initialize_implicit_solvent(simulation_parameters)
@@ -552,9 +570,18 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
             x = system["coordinates"]
 
             v = v + f * dt2m
+
+            # Zero velocities for fixed atoms
+            if mobile_mask_jax is not None:
+                v = v * mobile_mask_jax
+
             x = x + dt2 * v
             x, v, system = thermo_update(x, v, system)
             x = x + dt2 * v
+
+            # Restore fixed atom positions
+            if mobile_mask_jax is not None:
+                x = x * mobile_mask_jax + reference_coords * (1.0 - mobile_mask_jax)
 
             return {**system, "coordinates": x, "vel": v}
 
@@ -733,10 +760,26 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
         def _update_velocities_and_energy(v, f, dt2m, mass, corr_kin, nreplicas):
             """JIT-optimized velocity and energy update"""
             v = v + f * dt2m
-            ek_tensor = (
-                (0.5 / nreplicas / corr_kin)
-                * jnp.sum(mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0)
-            )
+
+            # Zero velocities for fixed atoms
+            if mobile_mask_jax is not None:
+                v = v * mobile_mask_jax
+
+            # Kinetic energy calculation
+            # Note: mobile_mask_jax has shape (nat, 1), need to squeeze for scalar multiplication
+            if mobile_mask_jax is not None:
+                # Only include mobile atoms in kinetic energy
+                # Use mobile_mask squeezed to (nat,) for proper broadcasting with (nat, 3, 3)
+                mobile_mask_scalar = mobile_mask_jax[:, 0]  # Shape: (nat,)
+                ek_tensor = (
+                    (0.5 / nreplicas / corr_kin)
+                    * jnp.sum(mobile_mask_scalar[:, None, None] * mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0)
+                )
+            else:
+                ek_tensor = (
+                    (0.5 / nreplicas / corr_kin)
+                    * jnp.sum(mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0)
+                )
             ek = jnp.trace(ek_tensor)
             return v, ek, ek_tensor
             

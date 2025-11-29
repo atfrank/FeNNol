@@ -138,15 +138,21 @@ def dynamic(simulation_parameters, device, fprec):
         
         # Run the minimization
         min_result = minimize_system(model, system_data, conformation, simulation_parameters, fprec)
-        
+
         # Update conformation with minimized coordinates
         conformation = {**conformation, "coordinates": min_result["coordinates"]}
-        
+
         # If minimize_only is set, we're done
         if simulation_parameters.get("minimize_only", False):
             print("# Minimization complete. Exiting as minimize_only=True")
             return
-        
+
+        # Re-run preprocessing with minimized coordinates to rebuild neighbor list
+        print("# Rebuilding neighbor list with minimized coordinates...")
+        preproc_state, conformation = initialize_preprocessing(
+            simulation_parameters, model, conformation, system_data
+        )
+
         print("# Minimization complete. Continuing with MD simulation...")
 
     random_seed = simulation_parameters.get(
@@ -377,7 +383,9 @@ def dynamic(simulation_parameters, device, fprec):
             ek = system["ek"]
             epot = system["epot"]
             etot = ek + epot
-            temper = 2 * ek / (3.0 * nat) * au.KELVIN
+            # Use mobile atom count for temperature (fixed atoms don't contribute)
+            n_mobile = dyn_state.get("n_mobile_atoms", nat)
+            temper = 2 * ek / (3.0 * n_mobile) * au.KELVIN
 
             th_state = system["thermostat"]
             if include_thermostat_energy:

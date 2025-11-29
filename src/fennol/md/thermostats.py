@@ -220,15 +220,19 @@ def get_thermostat(simulation_parameters, dt, system_data, fprec, rng_key=None):
                 jax.random.normal(rng_key, (nbeads, mass.shape[0], 3), dtype=fprec)
                 * (kT / mass[None, :, None]) ** 0.5
             )
+            # Use mobile atom count for DOF (fixed atoms don't contribute)
+            n_mobile = system_data.get("n_mobile_atoms", mass.shape[0])
             kTsys = jnp.sum(mass[None, :, None] * vel**2, axis=(1, 2)) / (
-                mass.shape[0] * 3
+                n_mobile * 3
             )
             vel = vel * (kT / kTsys[:, None, None]) ** 0.5
         thermostat = lambda x, s: (x, s)
 
     elif thermostat_name in ["NOSE", "NOSEHOOVER", "NOSE_HOOVER"]:
         assert gamma is not None, "gamma must be specified for QTB thermostat"
-        ndof = mass.shape[0] * 3
+        # Use mobile atom count for DOF (fixed atoms don't contribute)
+        n_mobile = system_data.get("n_mobile_atoms", mass.shape[0])
+        ndof = n_mobile * 3
         nkT = ndof * kT
         nose_mass = nkT / gamma**2
         assert nbeads is None, "Nose-Hoover is not compatible with PIMD"

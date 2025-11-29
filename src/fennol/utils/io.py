@@ -317,7 +317,25 @@ def parse_atom_selection(selection_dict: Dict[str, any], pdb_data: Optional[Dict
     # Residue number selection
     if 'residue_numbers' in selection_dict:
         res_mask = np.zeros(n_atoms, dtype=bool)
-        for res_spec in selection_dict['residue_numbers']:
+        res_nums_raw = selection_dict['residue_numbers']
+
+        # Handle single value vs list
+        if isinstance(res_nums_raw, (int, float)):
+            res_nums_raw = [int(res_nums_raw)]
+        elif isinstance(res_nums_raw, str):
+            # Single string value - strip quotes and split by comma if needed
+            res_nums_raw = res_nums_raw.strip('"\'')
+            if ',' in res_nums_raw:
+                res_nums_raw = [s.strip().strip('"\'') for s in res_nums_raw.split(',')]
+            else:
+                res_nums_raw = [res_nums_raw]
+
+        for res_spec in res_nums_raw:
+            # Strip quotes if present (from config file parsing)
+            if isinstance(res_spec, str):
+                res_spec = res_spec.strip('"\'')
+                if not res_spec:  # Skip empty strings
+                    continue
             if isinstance(res_spec, str) and '-' in res_spec:
                 # Range specification
                 start, end = map(int, res_spec.split('-'))

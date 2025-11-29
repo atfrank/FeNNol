@@ -239,7 +239,16 @@ def initialize_system(conformation, vel, model, system_data, fprec):
     f = np.array(f) / model_energy_unit
     epot = np.mean(e) / model_energy_unit
     vir = np.mean(vir, axis=0) / model_energy_unit
-    
+
+    # Handle vel=None (e.g., from minimizer)
+    if vel is None:
+        nat = len(conformation["coordinates"])
+        if "nbeads" in system_data:
+            nbeads = system_data["nbeads"]
+            vel = jnp.zeros((nbeads, nat, 3), dtype=fprec)
+        else:
+            vel = jnp.zeros((nat, 3), dtype=fprec)
+
     if "nbeads" in system_data:
         ek = 0.5 * jnp.sum(system_data["mass"][:, None,None] * vel[0,:,:,None]*vel[0,:,None,:],axis=0)
     else:
