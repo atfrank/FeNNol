@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from flax.core import freeze, unfreeze
 
 from ..utils.io import last_xyz_frame
+from ..utils.pdb import read_pdb as read_pdb_file
 
 
 from ..models import FENNIX
@@ -49,17 +50,33 @@ def load_model(simulation_parameters):
 def load_system_data(simulation_parameters, fprec):
     ## LOAD SYSTEM CONFORMATION FROM FILES
     system_name = str(simulation_parameters.get("system", "system")).strip()
-    indexed = simulation_parameters.get("xyz_input/indexed", True)
-    has_comment_line = simulation_parameters.get("xyz_input/has_comment_line", False)
-    xyzfile = Path(simulation_parameters.get("xyz_input/file", system_name + ".xyz"))
-    if not xyzfile.exists():
-        raise FileNotFoundError(f"xyz file {xyzfile} not found")
-    system_name = str(simulation_parameters.get("system", xyzfile.stem)).strip()
-    symbols, coordinates, _ = last_xyz_frame(
-        xyzfile, indexed=indexed, has_comment_line=has_comment_line
-    )
-    coordinates = coordinates.astype(fprec)
-    species = np.array([PERIODIC_TABLE_REV_IDX[s] for s in symbols], dtype=np.int32)
+
+    # Check for PDB input first, then fall back to XYZ
+    pdb_file = simulation_parameters.get("pdb_input/file", None)
+    if pdb_file is not None:
+        pdb_file = Path(str(pdb_file).strip())
+        if not pdb_file.exists():
+            raise FileNotFoundError(f"PDB file {pdb_file} not found")
+        system_name = str(simulation_parameters.get("system", pdb_file.stem)).strip()
+        print(f"# Loading coordinates from PDB: {pdb_file}")
+        pdb_structure = read_pdb_file(str(pdb_file))
+        symbols = pdb_structure.elements
+        coordinates = pdb_structure.coordinates.astype(fprec)
+        species = pdb_structure.atomic_numbers
+    else:
+        # Default to XYZ input
+        indexed = simulation_parameters.get("xyz_input/indexed", True)
+        has_comment_line = simulation_parameters.get("xyz_input/has_comment_line", False)
+        xyzfile = Path(simulation_parameters.get("xyz_input/file", system_name + ".xyz"))
+        if not xyzfile.exists():
+            raise FileNotFoundError(f"xyz file {xyzfile} not found")
+        system_name = str(simulation_parameters.get("system", xyzfile.stem)).strip()
+        symbols, coordinates, _ = last_xyz_frame(
+            xyzfile, indexed=indexed, has_comment_line=has_comment_line
+        )
+        coordinates = coordinates.astype(fprec)
+        species = np.array([PERIODIC_TABLE_REV_IDX[s] for s in symbols], dtype=np.int32)
+
     nat = species.shape[0]
 
     ## GET MASS
