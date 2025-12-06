@@ -725,12 +725,25 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
     if chain_of_interest is None:
         raise ValueError("scale_md.chain_of_interest is required")
 
-    # Alpha values
+    # Alpha values - handle both list and single value
     alpha_values = scale_md_params.get("alpha_values", [0.1, 0.2, 0.5, 1.0])
     if isinstance(alpha_values, (int, float)):
         alpha_values = [float(alpha_values)]
-    else:
+    elif isinstance(alpha_values, str):
+        # Handle string like "[0.5, 1.0]" or "0.5 1.0"
+        alpha_values = alpha_values.strip('[]').replace(',', ' ').split()
         alpha_values = [float(a) for a in alpha_values]
+    else:
+        # Handle list - clean up any bracket characters
+        cleaned = []
+        for a in alpha_values:
+            if isinstance(a, str):
+                a = a.strip('[]').replace(',', '')
+                if a:  # Skip empty strings
+                    cleaned.append(float(a))
+            else:
+                cleaned.append(float(a))
+        alpha_values = cleaned
 
     # Backbone fixing
     fix_backbone = scale_md_params.get("fix_backbone", {})
@@ -739,7 +752,11 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         fix_backbone_enabled = fix_backbone_enabled.lower() in ("true", "yes", "1")
     fix_backbone_chains = fix_backbone.get("chains", [])
     if isinstance(fix_backbone_chains, str):
-        fix_backbone_chains = [fix_backbone_chains]
+        # Handle strings like '["A"]' or 'A B' or 'A'
+        fix_backbone_chains = fix_backbone_chains.strip('[]"\'').replace(',', ' ').split()
+    elif isinstance(fix_backbone_chains, list):
+        # Clean up list items
+        fix_backbone_chains = [str(c).strip('[]"\'') for c in fix_backbone_chains]
 
     # Early stopping
     early_stopping = scale_md_params.get("early_stopping", {})
@@ -752,15 +769,15 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
 
     # Output
     output = scale_md_params.get("output", {})
-    trajectory_prefix = output.get("trajectory_prefix", "traj")
-    distance_file = output.get("distance_file", "distances.dat")
+    trajectory_prefix = str(output.get("trajectory_prefix", "traj")).strip('"\'')
+    distance_file = str(output.get("distance_file", "distances.dat")).strip('"\'')
+    thermostat_str = str(scale_md_params.get("thermostat", "langevin")).strip('"\'')
 
     # MD parameters
     temperature = float(simulation_parameters.get("temperature", 300.0))
     timestep = float(simulation_parameters.get("dt", 1.0))
     nsteps_per_alpha = int(scale_md_params.get("nsteps_per_alpha",
                                                simulation_parameters.get("nsteps", 10000)))
-    thermostat = scale_md_params.get("thermostat", "langevin")
     gamma = float(scale_md_params.get("gamma", 1.0))
 
     # Minimization
@@ -770,8 +787,8 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
     min_steps_minimize = int(scale_md_params.get("min_steps", 500))
 
     return ScaleMDConfig(
-        pdb_file=str(pdb_file),
-        chain_of_interest=str(chain_of_interest),
+        pdb_file=str(pdb_file).strip('"\''),
+        chain_of_interest=str(chain_of_interest).strip('"\''),
         alpha_values=alpha_values,
         fix_backbone_enabled=fix_backbone_enabled,
         fix_backbone_chains=fix_backbone_chains,
@@ -784,7 +801,7 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         temperature=temperature,
         timestep=timestep,
         nsteps_per_alpha=nsteps_per_alpha,
-        thermostat=thermostat,
+        thermostat=thermostat_str,
         gamma=gamma,
         minimize_first=minimize_first,
     )
