@@ -29,6 +29,16 @@ from ..utils.input_parser import parse_input
 from .initial import load_model, load_system_data, initialize_preprocessing
 from .integrate import initialize_dynamics
 from .minimize import minimize_system
+from .simulated_tempering import (
+    setup_simulated_tempering,
+    attempt_temperature_jump,
+    rescale_velocities,
+    should_write_trajectory,
+    get_current_temperature,
+    get_current_kT,
+    print_st_statistics,
+    update_step_histogram,
+)
 
 from copy import deepcopy
 
@@ -138,15 +148,21 @@ def dynamic(simulation_parameters, device, fprec):
         
         # Run the minimization
         min_result = minimize_system(model, system_data, conformation, simulation_parameters, fprec)
-        
+
         # Update conformation with minimized coordinates
         conformation = {**conformation, "coordinates": min_result["coordinates"]}
-        
+
         # If minimize_only is set, we're done
         if simulation_parameters.get("minimize_only", False):
             print("# Minimization complete. Exiting as minimize_only=True")
             return
-        
+
+        # Re-run preprocessing with minimized coordinates to rebuild neighbor list
+        print("# Rebuilding neighbor list with minimized coordinates...")
+        preproc_state, conformation = initialize_preprocessing(
+            simulation_parameters, model, conformation, system_data
+        )
+
         print("# Minimization complete. Continuing with MD simulation...")
 
     random_seed = simulation_parameters.get(
@@ -165,6 +181,18 @@ def dynamic(simulation_parameters, device, fprec):
     nsteps = int(simulation_parameters.get("nsteps"))
     start_time = 0.0
     start_step = 0
+
+    ### Setup simulated tempering if configured
+    st_config = simulation_parameters.get("simulated_tempering", None)
+    use_simulated_tempering = st_config is not None
+
+    if use_simulated_tempering:
+        initial_temp = simulation_parameters.get("temperature", 300.0)
+        st_state = setup_simulated_tempering(st_config, system_data, initial_temp)
+        nst_tempering = st_state["nst_tempering"]
+    else:
+        st_state = None
+        nst_tempering = 0
 
     ### Set I/O parameters
     Tdump = simulation_parameters.get("tdump", 1.0 / au.PS) * au.FS
@@ -258,7 +286,11 @@ def dynamic(simulation_parameters, device, fprec):
     save_keys = simulation_parameters.get("save_keys", [])
     if save_keys:
         print(f"# Saving keys: {save_keys}")
-        fkeys = open(f"{system_name}.traj.pkl", "wb+")
+        import os
+        pkl_file = f"{system_name}.traj.pkl"
+        if os.path.exists(pkl_file):
+            os.remove(pkl_file)
+        fkeys = open(pkl_file, "wb")
     else:
         fkeys = None
 
@@ -279,6 +311,10 @@ def dynamic(simulation_parameters, device, fprec):
         header += "  Temp_c[K]"
     if include_thermostat_energy:
         header += "      Etherm"
+    # Check if GB implicit solvent is enabled
+    has_gb_model = "implicit_solvent" in simulation_parameters
+    if has_gb_model:
+        header += "         EGB"
     if use_restraints:
         header += "   Erestraint"
     if estimate_pressure:
@@ -308,20 +344,35 @@ def dynamic(simulation_parameters, device, fprec):
 
     write_all_beads = simulation_parameters.get("write_all_beads", False) and pimd
 
+    # Delete existing trajectory files to avoid appending to old runs
+    import os
     if write_all_beads:
+        for i in range(nbeads):
+            traj_file = f"{system_name}_bead{i+1:03d}" + traj_ext
+            if os.path.exists(traj_file):
+                os.remove(traj_file)
         fout = [
-            open(f"{system_name}_bead{i+1:03d}" + traj_ext, "a") for i in range(nbeads)
+            open(f"{system_name}_bead{i+1:03d}" + traj_ext, "w") for i in range(nbeads)
         ]
     else:
-        fout = open(system_name + traj_ext, "a")
+        traj_file = system_name + traj_ext
+        if os.path.exists(traj_file):
+            os.remove(traj_file)
+        fout = open(system_name + traj_ext, "w")
 
     ensemble_key = simulation_parameters.get("etot_ensemble_key", None)
     if ensemble_key is not None:
-        fens = open(f"{system_name}.ensemble_weights.traj", "a")
+        ensemble_file = f"{system_name}.ensemble_weights.traj"
+        if os.path.exists(ensemble_file):
+            os.remove(ensemble_file)
+        fens = open(ensemble_file, "w")
 
     write_centroid = simulation_parameters.get("write_centroid", False) and pimd
     if write_centroid:
-        fcentroid = open(f"{system_name}_centroid" + traj_ext, "a")
+        centroid_file = f"{system_name}_centroid" + traj_ext
+        if os.path.exists(centroid_file):
+            os.remove(centroid_file)
+        fcentroid = open(centroid_file, "w")
 
     fcolvars = None
 
@@ -344,6 +395,40 @@ def dynamic(simulation_parameters, device, fprec):
             istep, dyn_state, system, conformation, preproc_state, force_preprocess
         )
 
+        ### Simulated tempering: update step histogram (tracks time at each T)
+        if use_simulated_tempering:
+            st_state = update_step_histogram(st_state)
+
+        ### Simulated tempering: attempt temperature jump
+        if use_simulated_tempering and istep % nst_tempering == 0:
+            rng_key, st_key = jax.random.split(rng_key)
+            epot = system["epot"]
+
+            old_temp = get_current_temperature(st_state)
+            st_state, accepted, new_idx = attempt_temperature_jump(
+                st_state, epot, st_key
+            )
+
+            if accepted:
+                new_temp = get_current_temperature(st_state)
+                new_kT = new_temp / au.KELVIN
+
+                # Rescale velocities
+                system["vel"] = rescale_velocities(
+                    system["vel"], old_temp, new_temp
+                )
+
+                # Update kT in dyn_state for thermostat
+                dyn_state["kT"] = new_kT
+
+                # Update thermostat state kT for dynamic temperature support
+                if "thermostat" in system:
+                    system["thermostat"]["kT"] = new_kT
+
+                # Also update system_data kT for consistency
+                system_data["kT"] = new_kT
+                system_data["temperature"] = new_temp
+
         ### print properties
         if istep % nprint == 0:
             t1 = time.time()
@@ -354,7 +439,9 @@ def dynamic(simulation_parameters, device, fprec):
             ek = system["ek"]
             epot = system["epot"]
             etot = ek + epot
-            temper = 2 * ek / (3.0 * nat) * au.KELVIN
+            # Use mobile atom count for temperature (fixed atoms don't contribute)
+            n_mobile = dyn_state.get("n_mobile_atoms", nat)
+            temper = 2 * ek / (3.0 * n_mobile) * au.KELVIN
 
             th_state = system["thermostat"]
             if include_thermostat_energy:
@@ -365,6 +452,11 @@ def dynamic(simulation_parameters, device, fprec):
             has_restraints = "restraint_energy" in system
             if has_restraints:
                 restraint_energy = system["restraint_energy"]
+
+            # Track GB solvation energy if present
+            has_gb = "gb_energy" in system
+            if has_gb:
+                gb_energy = system["gb_energy"]
 
             properties_traj[f"Etot[{atom_energy_unit_str}]"].append(
                 etot * atom_energy_unit
@@ -379,6 +471,10 @@ def dynamic(simulation_parameters, device, fprec):
             if has_restraints:
                 properties_traj[f"Erestraint[{atom_energy_unit_str}]"].append(
                     restraint_energy * atom_energy_unit
+                )
+            if has_gb:
+                properties_traj[f"EGB[{atom_energy_unit_str}]"].append(
+                    gb_energy * atom_energy_unit
                 )
             if pimd:
                 ek_c = system["ek_c"]
@@ -395,6 +491,8 @@ def dynamic(simulation_parameters, device, fprec):
                 properties_traj[f"Etherm[{atom_energy_unit_str}]"].append(
                     etherm * atom_energy_unit
                 )
+            if has_gb:
+                line += f"  {gb_energy*atom_energy_unit: #10.4f}"
             if has_restraints:
                 line += f"  {restraint_energy*atom_energy_unit: #10.4f}"
             if estimate_pressure:
@@ -565,29 +663,41 @@ def dynamic(simulation_parameters, device, fprec):
 
         ### save frame
         if istep % ndump == 0:
-            line = "# Write XYZ frame"
-            if variable_cell:
-                cell = np.array(system["cell"])
-                reciprocal_cell = np.linalg.inv(cell)
-            if do_wrap_box:
-                if pimd:
-                    centroid = wrapbox(system["coordinates"][0], cell, reciprocal_cell)
-                    system["coordinates"] = system["coordinates"].at[0].set(centroid)
-                else:
-                    system["coordinates"] = wrapbox(
-                        system["coordinates"], cell, reciprocal_cell
-                    )
-                conformation = update_conformation(conformation, system)
-                line += " (atoms have been wrapped into the box)"
-                force_preprocess = True
-            print(line)
-            properties = {
-                "energy": float(system["epot"]) * energy_unit,
-                "Time": start_time + istep * dt,
-                "energy_unit": energy_unit_str,
-            }
+            # For simulated tempering, only write frames at reference temperature(s)
+            write_this_frame = True
+            if use_simulated_tempering:
+                write_this_frame = should_write_trajectory(st_state)
+                if not write_this_frame:
+                    current_temp = get_current_temperature(st_state)
+                    print(f"# Skip frame (T={current_temp:.1f} K not at reference)")
 
-            if write_all_beads:
+            if write_this_frame:
+                line = "# Write XYZ frame"
+                if use_simulated_tempering:
+                    current_temp = get_current_temperature(st_state)
+                    line += f" (T={current_temp:.1f} K)"
+                if variable_cell:
+                    cell = np.array(system["cell"])
+                    reciprocal_cell = np.linalg.inv(cell)
+                if do_wrap_box:
+                    if pimd:
+                        centroid = wrapbox(system["coordinates"][0], cell, reciprocal_cell)
+                        system["coordinates"] = system["coordinates"].at[0].set(centroid)
+                    else:
+                        system["coordinates"] = wrapbox(
+                            system["coordinates"], cell, reciprocal_cell
+                        )
+                    conformation = update_conformation(conformation, system)
+                    line += " (atoms have been wrapped into the box)"
+                    force_preprocess = True
+                print(line)
+                properties = {
+                    "energy": float(system["epot"]) * energy_unit,
+                    "Time": start_time + istep * dt,
+                    "energy_unit": energy_unit_str,
+                }
+
+            if write_this_frame and write_all_beads:
                 coords = np.asarray(conformation["coordinates"].reshape(-1, nat, 3))
                 for i, fb in enumerate(fout):
                     write_frame(
@@ -598,7 +708,7 @@ def dynamic(simulation_parameters, device, fprec):
                         properties=properties,
                         forces=None,  # np.asarray(system["forces"].reshape(nbeads, nat, 3)[0]) * energy_unit,
                     )
-            else:
+            elif write_this_frame:
                 write_frame(
                     fout,
                     system_data["symbols"],
@@ -607,7 +717,7 @@ def dynamic(simulation_parameters, device, fprec):
                     properties=properties,
                     forces=None,  # np.asarray(system["forces"].reshape(nbeads, nat, 3)[0]) * energy_unit,
                 )
-            if write_centroid:
+            if write_this_frame and write_centroid:
                 centroid = np.asarray(system["coordinates"][0])
                 write_frame(
                     fcentroid,
@@ -618,7 +728,7 @@ def dynamic(simulation_parameters, device, fprec):
                     forces=np.asarray(system["forces"].reshape(nbeads, nat, 3)[0])
                     * energy_unit,
                 )
-            if ensemble_key is not None:
+            if write_this_frame and ensemble_key is not None:
                 weights = " ".join(
                     [f"{w:.6f}" for w in system["ensemble_weights"].tolist()]
                 )
@@ -683,6 +793,11 @@ def dynamic(simulation_parameters, device, fprec):
                 print(f"#   {name:10} : {mu: #10.5g}   +/- {sig: #9.3g}  {unit}")
 
             print(f"# Perf.: {nsperday:.2f} ns/day  ( {1.0 / tperstep:.2f} step/s )")
+
+            # Print simulated tempering statistics
+            if use_simulated_tempering:
+                print_st_statistics(st_state, istep)
+
             print("#" * 50)
             if istep < nsteps:
                 print(header)
@@ -690,6 +805,12 @@ def dynamic(simulation_parameters, device, fprec):
             properties_traj = defaultdict(list)
 
     print(f"# Run done in {human_time_duration(time.time()-tstart_dyn)}")
+
+    # Print final simulated tempering statistics
+    if use_simulated_tempering:
+        print("#" * 50)
+        print("# Final Simulated Tempering Statistics:")
+        print_st_statistics(st_state, nsteps)
     
     # PMF calculation has been moved to post-processing
     # Use calculate_pmf_post.py to analyze reaction coordinate data

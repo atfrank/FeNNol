@@ -1,0 +1,41 @@
+# Water molecule MD with ANI2x + GB implicit solvent
+# Testing the fixed JAX GB implementation
+
+files {
+  pdb = water.pdb
+}
+
+model {
+  model = ANI2x
+  ani_model_ensemble = false
+}
+
+implicit_solvent {
+  use_implicit_solvent = true
+  model = OBC
+  dielectric = 80.0
+  cutoff = 8.0
+  surface_tension = 0.005
+  probe_radius = 1.4
+  radii_set = mbondi
+  include_nonpolar = false
+}
+
+simulation {
+  nsteps = 500
+  dt = 0.5
+  temperature = 300.0
+  thermostat = langevin
+  gamma = 1.0
+}
+
+output {
+  output_frequency = 10
+  trajectory_file = water_gb_trajectory.xyz
+  log_file = water_gb_md.log
+}
+
+neighbor_list {
+  nblist_skin = 1.0
+  nblist_add_neigh = 20
+}

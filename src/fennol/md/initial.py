@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from flax.core import freeze, unfreeze
 
 from ..utils.io import last_xyz_frame
+from ..utils.pdb import read_pdb as read_pdb_file
 
 
 from ..models import FENNIX
@@ -49,17 +50,33 @@ def load_model(simulation_parameters):
 def load_system_data(simulation_parameters, fprec):
     ## LOAD SYSTEM CONFORMATION FROM FILES
     system_name = str(simulation_parameters.get("system", "system")).strip()
-    indexed = simulation_parameters.get("xyz_input/indexed", True)
-    has_comment_line = simulation_parameters.get("xyz_input/has_comment_line", False)
-    xyzfile = Path(simulation_parameters.get("xyz_input/file", system_name + ".xyz"))
-    if not xyzfile.exists():
-        raise FileNotFoundError(f"xyz file {xyzfile} not found")
-    system_name = str(simulation_parameters.get("system", xyzfile.stem)).strip()
-    symbols, coordinates, _ = last_xyz_frame(
-        xyzfile, indexed=indexed, has_comment_line=has_comment_line
-    )
-    coordinates = coordinates.astype(fprec)
-    species = np.array([PERIODIC_TABLE_REV_IDX[s] for s in symbols], dtype=np.int32)
+
+    # Check for PDB input first, then fall back to XYZ
+    pdb_file = simulation_parameters.get("pdb_input/file", None)
+    if pdb_file is not None:
+        pdb_file = Path(str(pdb_file).strip())
+        if not pdb_file.exists():
+            raise FileNotFoundError(f"PDB file {pdb_file} not found")
+        system_name = str(simulation_parameters.get("system", pdb_file.stem)).strip()
+        print(f"# Loading coordinates from PDB: {pdb_file}")
+        pdb_structure = read_pdb_file(str(pdb_file))
+        symbols = pdb_structure.elements
+        coordinates = pdb_structure.coordinates.astype(fprec)
+        species = pdb_structure.atomic_numbers
+    else:
+        # Default to XYZ input
+        indexed = simulation_parameters.get("xyz_input/indexed", True)
+        has_comment_line = simulation_parameters.get("xyz_input/has_comment_line", False)
+        xyzfile = Path(simulation_parameters.get("xyz_input/file", system_name + ".xyz"))
+        if not xyzfile.exists():
+            raise FileNotFoundError(f"xyz file {xyzfile} not found")
+        system_name = str(simulation_parameters.get("system", xyzfile.stem)).strip()
+        symbols, coordinates, _ = last_xyz_frame(
+            xyzfile, indexed=indexed, has_comment_line=has_comment_line
+        )
+        coordinates = coordinates.astype(fprec)
+        species = np.array([PERIODIC_TABLE_REV_IDX[s] for s in symbols], dtype=np.int32)
+
     nat = species.shape[0]
 
     ## GET MASS
@@ -206,6 +223,9 @@ def initialize_preprocessing(simulation_parameters, model, conformation, system_
             stnew["nblist_mult_size"] = simulation_parameters["nblist_mult_size"]
         if "nblist_add_neigh" in simulation_parameters:
             stnew["add_neigh"] = simulation_parameters["nblist_add_neigh"]
+            # Also update max_neigh if it exists (for angle layers)
+            if "max_neigh" in stnew:
+                stnew["max_neigh"] = simulation_parameters["nblist_add_neigh"]
         layer_state.append(freeze(stnew))
     preproc_state["layers_state"] = layer_state
     preproc_state = freeze(preproc_state)
@@ -236,7 +256,16 @@ def initialize_system(conformation, vel, model, system_data, fprec):
     f = np.array(f) / model_energy_unit
     epot = np.mean(e) / model_energy_unit
     vir = np.mean(vir, axis=0) / model_energy_unit
-    
+
+    # Handle vel=None (e.g., from minimizer)
+    if vel is None:
+        nat = len(conformation["coordinates"])
+        if "nbeads" in system_data:
+            nbeads = system_data["nbeads"]
+            vel = jnp.zeros((nbeads, nat, 3), dtype=fprec)
+        else:
+            vel = jnp.zeros((nat, 3), dtype=fprec)
+
     if "nbeads" in system_data:
         ek = 0.5 * jnp.sum(system_data["mass"][:, None,None] * vel[0,:,:,None]*vel[0,:,None,:],axis=0)
     else:

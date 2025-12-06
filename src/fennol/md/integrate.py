@@ -26,9 +26,29 @@ from .barostats import get_barostat
 from .colvars import setup_colvars
 from .restraints import setup_restraints, apply_restraints
 from .spectra import initialize_ir_spectrum
+from .fixed_atoms import setup_fixed_atoms
 
 from copy import deepcopy
 from .initial import initialize_system
+
+# Import implicit solvent models
+from ..models.physics.implicit_solvent import create_implicit_solvent_model
+
+
+def initialize_implicit_solvent(simulation_parameters):
+    """Initialize implicit solvent model if specified in parameters."""
+    implicit_solvent_params = simulation_parameters.get("implicit_solvent", None)
+
+    if implicit_solvent_params is None:
+        return None
+
+    # Extract model type and parameters
+    model_type = implicit_solvent_params.get("model", "OBC")
+
+    print(f"# Initializing implicit solvent: {model_type}")
+    gb_model = create_implicit_solvent_model(model_type, implicit_solvent_params)
+
+    return gb_model
 
 
 def initialize_dynamics(
@@ -144,7 +164,14 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
         
     ### restraints
     restraints_definitions = simulation_parameters.get("restraints", None)
-    use_restraints = restraints_definitions is not None
+    # Check if restraints should be disabled during MD (even if defined)
+    md_use_restraints = simulation_parameters.get("use_restraints", True)
+    if isinstance(md_use_restraints, str):
+        md_use_restraints = md_use_restraints.lower() in ("yes", "true", "1", "on")
+
+    use_restraints = restraints_definitions is not None and md_use_restraints
+    if restraints_definitions is not None and not md_use_restraints:
+        print("# Restraints defined but disabled for MD (use_restraints = no)")
     if use_restraints:
         # Check if restraint debug is enabled
         restraint_debug = simulation_parameters.get("restraint_debug", False)
@@ -191,6 +218,95 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
         dyn_state["restraint_metadata"] = restraint_metadata
     else:
         restraint_energies, restraint_forces = {}, []
+
+    ### fixed atoms
+    fixed_atoms_config = simulation_parameters.get("fixed_atoms", None)
+    use_fixed_atoms = fixed_atoms_config is not None
+    if use_fixed_atoms:
+        system_data = setup_fixed_atoms(fixed_atoms_config, system_data, conformation)
+        # Create JAX arrays for mask and reference coordinates
+        mobile_mask_jax = jnp.asarray(~system_data["fixed_mask"], dtype=fprec)[:, None]
+        n_mobile = system_data["n_mobile_atoms"]
+        reference_coords = jnp.asarray(system_data["reference_coordinates"], dtype=fprec)
+    else:
+        mobile_mask_jax = None
+        n_mobile = nat
+        reference_coords = None
+
+    # Store mobile atom count in dyn_state for temperature calculation
+    dyn_state["n_mobile_atoms"] = n_mobile
+
+    ### Implicit solvent (GB)
+    gb_model = initialize_implicit_solvent(simulation_parameters)
+    use_implicit_solvent = gb_model is not None
+
+    with open('/tmp/gb_init_debug.txt', 'w') as f:
+        f.write(f"GB initialized: use_implicit_solvent={use_implicit_solvent}, gb_model={gb_model}\n")
+
+    if use_implicit_solvent:
+        # Get atomic numbers and add charges to conformation
+        # Charges can be provided in parameters, or we'll use AM1-BCC charges
+        species = conformation.get("species", None)
+
+        charges_input = simulation_parameters.get("implicit_solvent", {}).get("charges", None)
+        if charges_input is not None:
+            # User-provided charges
+            import numpy as np
+            charges = np.array(charges_input, dtype=fprec)
+        elif species is not None:
+            # Assign default charges based on atom type
+            # For proteins, use simple charge estimates:
+            # N: -0.3, O: -0.5, H: +0.3, C: +0.1, S: 0.0
+            # For water: O=-0.834, H=+0.417
+            import numpy as np
+            charges = np.zeros(len(species), dtype=fprec)
+
+            # Count atom types to detect if this is water or protein
+            # Convert JAX array to numpy for counting
+            species_np = np.array(species) if hasattr(species, '__array__') else species
+            atom_counts = {}
+            for atom_num in species_np:
+                atom_num_int = int(atom_num)
+                atom_counts[atom_num_int] = atom_counts.get(atom_num_int, 0) + 1
+
+            # Check if this looks like water (mostly H and O)
+            is_water = (1 in atom_counts and 8 in atom_counts and
+                       len(atom_counts) <= 2 and atom_counts.get(1, 0) > atom_counts.get(8, 0))
+
+            for i, atom_num in enumerate(species_np):
+                atom_num_int = int(atom_num)
+                if is_water:
+                    # Water charges (TIP3P)
+                    if atom_num_int == 8:  # Oxygen
+                        charges[i] = -0.834
+                    elif atom_num_int == 1:  # Hydrogen
+                        charges[i] = +0.417
+                else:
+                    # Protein/general organic molecule charges (simple estimate)
+                    if atom_num_int == 7:  # Nitrogen
+                        charges[i] = -0.3
+                    elif atom_num_int == 8:  # Oxygen
+                        charges[i] = -0.5
+                    elif atom_num_int == 1:  # Hydrogen
+                        charges[i] = +0.3
+                    elif atom_num_int == 6:  # Carbon
+                        charges[i] = +0.1
+                    elif atom_num_int == 16:  # Sulfur
+                        charges[i] = 0.0
+                    # Other atoms default to 0.0
+
+            # Normalize to ensure charge neutrality
+            net_charge = charges.sum()
+            if abs(net_charge) > 1e-6:
+                charges -= net_charge / len(charges)
+        else:
+            charges = None
+
+        if charges is not None:
+            conformation["charges"] = charges
+            print(f"# Implicit solvent enabled for MD with {len(charges)} atoms")
+        else:
+            print(f"# Warning: Implicit solvent enabled but charges not available")
 
     ### ir spectrum
     do_ir_spectrum = simulation_parameters.get("ir_spectrum", False)
@@ -265,7 +381,8 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
                 "vel": eigv,
             }
 
-        @jax.jit
+        # NOTE: JIT disabled to allow GB implicit solvent forces
+        # @jax.jit
         def update_forces(system, conformation):
             if estimate_pressure:
                 epot, f, vir_t, out = model._energy_and_forces_and_virial(
@@ -286,7 +403,75 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
                 epot = epot / model_energy_unit
                 f = f / model_energy_unit
                 new_sys = {**system, "forces": coords_to_eig(f), "epot": jnp.mean(epot)}
-            
+
+            # Apply implicit solvent (GB) forces if enabled
+            if use_implicit_solvent:
+                # Get coordinates (handle both regular and PIMD cases)
+                coords = conformation["coordinates"]
+                if coords.ndim == 3:  # PIMD case
+                    coords = coords[0]  # Use centroid
+
+                # Get charges and atomic numbers from conformation
+                charges = conformation.get("charges", None)
+                species = conformation.get("species", None)
+
+                # Write to file since prints may be stripped by JIT
+                if not hasattr(update_forces, '_gb_called'):
+                    with open('/tmp/gb_debug.txt', 'w') as f:
+                        f.write(f"GB block reached: charges={charges is not None}, species={species is not None}\n")
+                    update_forces._gb_called = True
+
+                if charges is not None and species is not None:
+                    try:
+                        # Compute GB energy and forces
+                        gb_energy, gb_forces = gb_model.compute_energy_forces(
+                            coords, charges, species
+                        )
+
+                        # Scale GB forces gradually from 0 to 1 over first N steps
+                        # This helps diagnose if force magnitude is the issue
+                        if not hasattr(update_forces, '_gb_step_count'):
+                            update_forces._gb_step_count = 0
+
+                        # Ramp up over 100 steps
+                        ramp_steps = 100
+                        gb_scale = min(1.0, update_forces._gb_step_count / ramp_steps)
+                        update_forces._gb_step_count += 1
+
+                        if update_forces._gb_step_count <= ramp_steps + 1:
+                            print(f"GB force scaling at step {update_forces._gb_step_count}: {gb_scale:.3f}")
+
+                        # Convert GB energy and forces from kcal/mol to Hartree
+                        # GB outputs: energy in kcal/mol, forces in kcal/mol/Å
+                        # Model uses: energy in Hartree, forces in Hartree/Bohr
+                        # 1 kcal/mol = 0.001593601 Hartree
+                        # 1 kcal/mol/Å = 0.001593601 Hartree/Bohr (same factor since Å = Bohr in atomic units)
+                        kcal_to_hartree = 0.001593601
+
+                        gb_energy_au = gb_energy * kcal_to_hartree
+                        gb_forces_au = gb_forces * kcal_to_hartree
+
+                        # Add GB energy to total potential energy (convert to per-atom)
+                        natoms = coords.shape[0] if coords.ndim == 2 else coords.shape[1]
+                        new_sys["epot"] = new_sys["epot"] + gb_scale * gb_energy_au / natoms
+
+                        # Add scaled GB forces to total forces (now in Hartree/Bohr)
+                        gb_forces_scaled = gb_scale * gb_forces_au
+                        gb_forces_eig = jnp.zeros_like(new_sys["forces"])
+                        if new_sys["forces"].ndim == 3:  # PIMD case
+                            gb_forces_eig = gb_forces_eig.at[0].set(gb_forces_scaled)
+                        else:
+                            gb_forces_eig = gb_forces_scaled
+                        new_sys["forces"] = new_sys["forces"] + gb_forces_eig
+
+                        # Store GB energy separately for reporting
+                        new_sys["gb_energy"] = gb_energy
+                    except Exception as e:
+                        print(f"ERROR in GB force computation: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        raise
+
             # Apply restraints if any are defined
             if use_restraints and len(restraint_forces) > 0:
                 # Use the current simulation step that was incremented at the beginning of the step function
@@ -392,9 +577,18 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
             x = system["coordinates"]
 
             v = v + f * dt2m
+
+            # Zero velocities for fixed atoms
+            if mobile_mask_jax is not None:
+                v = v * mobile_mask_jax
+
             x = x + dt2 * v
             x, v, system = thermo_update(x, v, system)
             x = x + dt2 * v
+
+            # Restore fixed atom positions
+            if mobile_mask_jax is not None:
+                x = x * mobile_mask_jax + reference_coords * (1.0 - mobile_mask_jax)
 
             return {**system, "coordinates": x, "vel": v}
 
@@ -412,6 +606,12 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
             return forces, energy
         
         def update_forces(system, conformation):
+            # DEBUG: Check if this function is called
+            if not hasattr(update_forces, '_called'):
+                with open('/tmp/update_forces_called.txt', 'w') as f:
+                    f.write(f"update_forces called, use_implicit_solvent={use_implicit_solvent}\n")
+                update_forces._called = True
+
             # Compute forces with the appropriate method
             if estimate_pressure:
                 epot, f, vir_t, out = model._energy_and_forces_and_virial(
@@ -430,7 +630,78 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
                 # Scale with JIT-compiled function
                 f, epot = _scale_forces_energy(f, epot)
                 new_sys = {**system, "forces": f, "epot": jnp.mean(epot)}
-            
+
+            # Apply implicit solvent (GB) forces if enabled
+            if use_implicit_solvent:
+                # Get coordinates
+                coords = conformation["coordinates"]
+
+                # Get charges and atomic numbers from conformation
+                charges = conformation.get("charges", None)
+                species = conformation.get("species", None)
+
+                # DEBUG
+                if not hasattr(update_forces, '_gb_check'):
+                    with open('/tmp/gb_charges_check.txt', 'w') as f:
+                        f.write(f"charges={charges is not None}, species={species is not None}\n")
+                        if charges is not None:
+                            f.write(f"charges={charges}\n")
+                        if species is not None:
+                            f.write(f"species={species}\n")
+                    update_forces._gb_check = True
+
+                if charges is not None and species is not None:
+                    try:
+                        # Compute GB energy and forces
+                        gb_energy, gb_forces = gb_model.compute_energy_forces(
+                            coords, charges, species
+                        )
+
+                        # Check for NaN in forces (JAX autodiff issue)
+                        import numpy as np
+                        if np.any(np.isnan(gb_forces)):
+                            if not hasattr(update_forces, '_nan_warned'):
+                                print("WARNING: GB forces contain NaN (JAX autodiff issue). Disabling GB forces.")
+                                print("         GB energy will still be computed but forces set to zero.")
+                                update_forces._nan_warned = True
+                            gb_forces = jnp.zeros_like(coords)
+
+                        # Scale GB forces gradually - use same counter as first update_forces
+                        if not hasattr(update_forces, '_gb_step_count'):
+                            update_forces._gb_step_count = 0
+
+                        ramp_steps = 100
+                        gb_scale = min(1.0, update_forces._gb_step_count / ramp_steps)
+                        update_forces._gb_step_count += 1
+
+                        if update_forces._gb_step_count == 1 and not np.any(np.isnan(gb_forces)):
+                            print(f"GB forces enabled with scaling from 0 to 1 over {ramp_steps} steps")
+
+                        # Convert GB energy and forces from kcal/mol to Hartree
+                        # GB outputs: energy in kcal/mol, forces in kcal/mol/Å
+                        # Model uses: energy in Hartree, forces in Hartree/Bohr
+                        # 1 kcal/mol = 0.001593601 Hartree
+                        # 1 kcal/mol/Å = 0.001593601 Hartree/Bohr (same factor since Å = Bohr in atomic units)
+                        kcal_to_hartree = 0.001593601
+
+                        gb_energy_au = gb_energy * kcal_to_hartree
+                        gb_forces_au = gb_forces * kcal_to_hartree
+
+                        # Add GB energy to total potential energy (convert to per-atom, scaled)
+                        natoms = coords.shape[0] if coords.ndim == 2 else coords.shape[1]
+                        new_sys["epot"] = new_sys["epot"] + gb_scale * gb_energy_au / natoms
+
+                        # Add scaled GB forces to total forces (now in Hartree/Bohr)
+                        new_sys["forces"] = new_sys["forces"] + gb_scale * gb_forces_au
+
+                        # Store GB energy separately for reporting (total energy)
+                        new_sys["gb_energy"] = gb_energy
+                    except Exception as e:
+                        if not hasattr(update_forces, '_gb_error_warned'):
+                            print(f"ERROR computing GB forces: {e}")
+                            print("Continuing without GB forces.")
+                            update_forces._gb_error_warned = True
+
             # Apply restraints if any are defined
             if use_restraints and len(restraint_forces) > 0:
                 # Use the current simulation step that was incremented at the beginning of the step function
@@ -496,10 +767,26 @@ def initialize_integrator(simulation_parameters, system_data, conformation, mode
         def _update_velocities_and_energy(v, f, dt2m, mass, corr_kin, nreplicas):
             """JIT-optimized velocity and energy update"""
             v = v + f * dt2m
-            ek_tensor = (
-                (0.5 / nreplicas / corr_kin)
-                * jnp.sum(mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0)
-            )
+
+            # Zero velocities for fixed atoms
+            if mobile_mask_jax is not None:
+                v = v * mobile_mask_jax
+
+            # Kinetic energy calculation
+            # Note: mobile_mask_jax has shape (nat, 1), need to squeeze for scalar multiplication
+            if mobile_mask_jax is not None:
+                # Only include mobile atoms in kinetic energy
+                # Use mobile_mask squeezed to (nat,) for proper broadcasting with (nat, 3, 3)
+                mobile_mask_scalar = mobile_mask_jax[:, 0]  # Shape: (nat,)
+                ek_tensor = (
+                    (0.5 / nreplicas / corr_kin)
+                    * jnp.sum(mobile_mask_scalar[:, None, None] * mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0)
+                )
+            else:
+                ek_tensor = (
+                    (0.5 / nreplicas / corr_kin)
+                    * jnp.sum(mass[:, None, None] * v[:, :, None] * v[:, None, :], axis=0)
+                )
             ek = jnp.trace(ek_tensor)
             return v, ek, ek_tensor
             
