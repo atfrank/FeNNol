@@ -28,10 +28,10 @@ scale_md {
         enabled = false
     }
 
-    # Early stopping - trigger when waters separate by 2 Angstroms
+    # Early stopping - trigger when waters separate by 1.0 Angstroms
     early_stopping {
         enabled = true
-        distance_threshold = 2.0  # Angstroms from initial COM
+        distance_threshold = 1.0  # Angstroms from initial COM
         min_steps = 500
         check_frequency = 100
     }
