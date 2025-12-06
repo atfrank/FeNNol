@@ -19,11 +19,11 @@ Config file example:
     scale_md {
         pdb_file = "protein_peptide.pdb"
         chain_of_interest = "B"           # Chain to track (1-indexed PDB chain ID)
-        alpha_values = [0.1, 0.2, 0.5, 1.0]
+        alpha_values = 0.1 0.2 0.5 1.0    # Space-separated alpha values
 
         fix_backbone {
             enabled = true
-            chains = ["A"]                # Fix backbone of these chains
+            chains = A                    # Fix backbone of these chains
         }
 
         early_stopping {
@@ -32,6 +32,10 @@ Config file example:
             min_steps = 1000
             check_frequency = 100
         }
+
+        # Force reporting options
+        report_inter_chain_forces = true  # Enable inter-chain force output
+        report_frequency = 10             # Write distances/forces every N steps
 
         output {
             trajectory_prefix = "traj"    # Will create traj_alpha_0.1.xyz, etc.
@@ -102,6 +106,9 @@ class ScaleMDConfig:
 
     # Inter-chain force reporting (expensive - off by default)
     report_inter_chain_forces: bool = False
+
+    # Reporting frequency (how often to write distances/forces to file)
+    report_frequency: int = 1  # Write every N steps (1 = every step)
 
     # MD parameters
     temperature: float = 300.0
@@ -517,8 +524,8 @@ class ScaleMDSimulation:
 
     def _compute_forces_with_scaling(self, coordinates: np.ndarray,
                                       alpha: float,
-                                      compute_inter_chain_forces: bool = False
-                                      ) -> Tuple[float, np.ndarray, Optional[Tuple[float, float, float]]]:
+                                      report_forces: bool = False
+                                      ) -> Tuple[float, np.ndarray, Optional[Dict[str, float]]]:
         """
         Compute forces with inter-chain scaling.
 
@@ -537,13 +544,14 @@ class ScaleMDSimulation:
         Args:
             coordinates: Atomic coordinates [n_atoms, 3]
             alpha: Scaling factor for inter-chain forces
-            compute_inter_chain_forces: If True, compute and return inter-chain
-                force magnitudes (expensive)
+            report_forces: If True, return inter-chain force info (no extra cost)
 
         Returns:
-            Tuple of (potential energy, forces [n_atoms, 3], inter_chain_force_info)
-            where inter_chain_force_info is None if not requested, or
-            (total_force, radial_force, tangential_force) if requested
+            Tuple of (potential energy, forces [n_atoms, 3], force_info)
+            where force_info is None if not requested, or dict with:
+            - F_radial_unscaled: Unscaled radial force magnitude
+            - F_radial_scaled: Scaled radial force magnitude (alpha * unscaled)
+            - F_tangential: Tangential force magnitude (unchanged by scaling)
         """
         # Create conformation
         conformation = {**self.conformation, "coordinates": coordinates}
@@ -561,54 +569,60 @@ class ScaleMDSimulation:
         forces = np.array(forces) / self.model_energy_unit
         epot = float(np.mean(epot)) / self.model_energy_unit
 
-        # Compute inter-chain force magnitudes BEFORE scaling (raw interaction strength)
-        inter_chain_force_info = None
-        if compute_inter_chain_forces:
-            inter_chain_force_info = compute_inter_chain_force_magnitude(
-                coordinates, forces, self.coi_mask, self.masses
-            )
+        # Initialize force info
+        force_info = None
 
-        if alpha != 1.0:
-            # Scale inter-chain forces
-            # Strategy: For atoms in chain of interest, scale the component of
-            # force that points toward/away from atoms in other chains
+        # Get COMs for force decomposition
+        coi_com = compute_chain_com(coordinates, self.coi_mask, self.masses)
+        other_com = compute_chain_com(coordinates, self.other_mask, self.masses)
 
-            # Get COMs
-            coi_com = compute_chain_com(coordinates, self.coi_mask, self.masses)
-            other_com = compute_chain_com(coordinates, self.other_mask, self.masses)
+        # Direction from COI to other chains
+        com_direction = other_com - coi_com
+        com_distance = np.linalg.norm(com_direction)
+        if com_distance > 1e-6:
+            com_direction = com_direction / com_distance
+        else:
+            com_direction = np.array([1.0, 0.0, 0.0])
 
-            # Direction from COI to other chains
-            com_direction = other_com - coi_com
-            com_distance = np.linalg.norm(com_direction)
-            if com_distance > 1e-6:
-                com_direction = com_direction / com_distance
-            else:
-                com_direction = np.array([1.0, 0.0, 0.0])
+        # For chain of interest atoms: decompose and scale the radial component
+        coi_forces = forces[self.coi_mask].copy()
 
-            # For chain of interest atoms: scale the radial component of force
-            coi_forces = forces[self.coi_mask].copy()
+        # Project forces onto COM direction
+        radial_component = np.sum(coi_forces * com_direction, axis=1, keepdims=True)
+        radial_forces = radial_component * com_direction
+        tangential_forces = coi_forces - radial_forces
 
-            # Project forces onto COM direction
-            radial_component = np.sum(coi_forces * com_direction, axis=1, keepdims=True)
-            radial_forces = radial_component * com_direction
-            tangential_forces = coi_forces - radial_forces
+        # Compute force magnitudes (sum vectors then take magnitude)
+        total_radial_unscaled = np.sum(radial_forces, axis=0)
+        total_tangential = np.sum(tangential_forces, axis=0)
 
-            # Scale only the radial (inter-chain) component
-            scaled_forces = tangential_forces + alpha * radial_forces
-            forces[self.coi_mask] = scaled_forces
+        radial_mag_unscaled = float(np.linalg.norm(total_radial_unscaled))
+        tangential_mag = float(np.linalg.norm(total_tangential))
+        radial_mag_scaled = float(alpha * radial_mag_unscaled)
 
-            # For other chain atoms: apply Newton's third law adjustment
-            other_forces = forces[self.other_mask].copy()
-            radial_component = np.sum(other_forces * (-com_direction), axis=1, keepdims=True)
-            radial_forces = radial_component * (-com_direction)
-            tangential_forces = other_forces - radial_forces
-            scaled_forces = tangential_forces + alpha * radial_forces
-            forces[self.other_mask] = scaled_forces
+        if report_forces:
+            force_info = {
+                "F_radial_unscaled": radial_mag_unscaled,
+                "F_radial_scaled": radial_mag_scaled,
+                "F_tangential": tangential_mag,
+            }
+
+        # Scale only the radial (inter-chain) component
+        scaled_coi_forces = tangential_forces + alpha * radial_forces
+        forces[self.coi_mask] = scaled_coi_forces
+
+        # For other chain atoms: apply Newton's third law adjustment
+        other_forces = forces[self.other_mask].copy()
+        radial_component = np.sum(other_forces * (-com_direction), axis=1, keepdims=True)
+        radial_forces_other = radial_component * (-com_direction)
+        tangential_forces_other = other_forces - radial_forces_other
+        scaled_other_forces = tangential_forces_other + alpha * radial_forces_other
+        forces[self.other_mask] = scaled_other_forces
 
         # Zero forces for fixed atoms
         forces[self.backbone_mask] = 0.0
 
-        return epot, forces, inter_chain_force_info
+        return epot, forces, force_info
 
     def run_single_alpha(self, alpha: float,
                          initial_coords: np.ndarray,
@@ -671,8 +685,10 @@ class ScaleMDSimulation:
                 coords[self.backbone_mask] = self.reference_coords[self.backbone_mask]
 
                 # Compute new forces (with optional inter-chain force computation)
+                # Only compute force info when we're going to report it
+                compute_forces_this_step = report_forces and (step % self.config.report_frequency == 0)
                 epot, forces, inter_chain_info = self._compute_forces_with_scaling(
-                    coords, alpha, compute_inter_chain_forces=report_forces
+                    coords, alpha, report_forces=compute_forces_this_step
                 )
 
                 # Second half step velocity update
@@ -696,23 +712,27 @@ class ScaleMDSimulation:
                 )
 
                 # Write distance data (with optional force info)
+                # Only write at report_frequency intervals
                 sim_time = step * self.config.timestep / 1000.0  # ps
-                if report_forces and inter_chain_info is not None:
-                    total_f, radial_f, tangential_f = inter_chain_info
-                    distance_writer.write(
-                        f"{alpha:.4f} {sim_time:.6f} {distance:.6f} "
-                        f"{total_f:.6f} {radial_f:.6f} {tangential_f:.6f}\n"
-                    )
-                else:
-                    distance_writer.write(f"{alpha:.4f} {sim_time:.6f} {distance:.6f}\n")
-                distance_writer.flush()
+                if step % self.config.report_frequency == 0:
+                    if report_forces and inter_chain_info is not None:
+                        distance_writer.write(
+                            f"{alpha:.4f} {sim_time:.6f} {distance:.6f} "
+                            f"{inter_chain_info['F_radial_unscaled']:.6f} "
+                            f"{inter_chain_info['F_radial_scaled']:.6f} "
+                            f"{inter_chain_info['F_tangential']:.6f}\n"
+                        )
+                    else:
+                        distance_writer.write(f"{alpha:.4f} {sim_time:.6f} {distance:.6f}\n")
+                    distance_writer.flush()
 
                 # Print progress
                 if step % 100 == 0:
                     if report_forces and inter_chain_info is not None:
-                        total_f, radial_f, _ = inter_chain_info
                         print(f"  Step {step:6d}: E = {epot:.4f} Ha, T = {temp:.1f} K, "
-                              f"d = {distance:.2f} A, F_inter = {radial_f:.4f}")
+                              f"d = {distance:.2f} A, "
+                              f"F_radial = {inter_chain_info['F_radial_unscaled']:.4f} "
+                              f"(scaled: {inter_chain_info['F_radial_scaled']:.4f})")
                     else:
                         print(f"  Step {step:6d}: E = {epot:.4f} Ha, T = {temp:.1f} K, "
                               f"d = {distance:.2f} A")
@@ -752,6 +772,9 @@ class ScaleMDSimulation:
         print(f"# Steps per alpha: {self.config.nsteps_per_alpha}")
         print(f"# Temperature: {self.config.temperature} K")
         print(f"# Timestep: {self.config.timestep} fs")
+        print(f"# Report frequency: every {self.config.report_frequency} steps")
+        if self.config.report_inter_chain_forces:
+            print(f"# Inter-chain force reporting: ENABLED")
 
         # Minimize initial structure
         if self.config.minimize_first:
@@ -773,7 +796,7 @@ class ScaleMDSimulation:
         # Open distance output file
         with open(self.config.distance_file, 'w') as dist_file:
             if self.config.report_inter_chain_forces:
-                dist_file.write("# alpha time_ps distance_A F_total F_radial F_tangential\n")
+                dist_file.write("# alpha time_ps distance_A F_radial_unscaled F_radial_scaled F_tangential\n")
             else:
                 dist_file.write("# alpha time_ps distance_A\n")
 
@@ -874,6 +897,9 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
     if isinstance(report_inter_chain_forces, str):
         report_inter_chain_forces = report_inter_chain_forces.lower() in ("true", "yes", "1")
 
+    # Reporting frequency (how often to write to distance file)
+    report_frequency = int(scale_md_params.get("report_frequency", 1))
+
     # MD parameters
     temperature = float(simulation_parameters.get("temperature", 300.0))
     timestep = float(simulation_parameters.get("dt", 1.0))
@@ -900,6 +926,7 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         trajectory_prefix=trajectory_prefix,
         distance_file=distance_file,
         report_inter_chain_forces=report_inter_chain_forces,
+        report_frequency=report_frequency,
         temperature=temperature,
         timestep=timestep,
         nsteps_per_alpha=nsteps_per_alpha,

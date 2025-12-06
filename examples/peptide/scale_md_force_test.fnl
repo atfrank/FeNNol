@@ -29,6 +29,8 @@ scale_md {
 
     # Enable inter-chain force reporting
     report_inter_chain_forces = true
+    # Report every N steps (reduces output file size)
+    report_frequency = 10
 
     minimize = true
     min_steps = 10
