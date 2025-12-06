@@ -1,0 +1,11 @@
+HEADER    WATER DIMER FOR FORCE SCALING TEST
+REMARK    Two water molecules as separate chains
+REMARK    Chain A: Water 1 (centered at origin)
+REMARK    Chain B: Water 2 (displaced by ~3 Angstroms)
+ATOM      1  O   HOH A   1       0.000   0.000   0.000  1.00  0.00           O
+ATOM      2  H1  HOH A   1       0.757   0.587   0.000  1.00  0.00           H
+ATOM      3  H2  HOH A   1      -0.757   0.587   0.000  1.00  0.00           H
+ATOM      4  O   HOH B   2       3.000   0.000   0.000  1.00  0.00           O
+ATOM      5  H1  HOH B   2       3.757   0.587   0.000  1.00  0.00           H
+ATOM      6  H2  HOH B   2       2.243   0.587   0.000  1.00  0.00           H
+END

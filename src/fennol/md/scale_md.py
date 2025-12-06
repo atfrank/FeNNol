@@ -75,6 +75,14 @@ from .thermostats import get_thermostat
 # Backbone atom names for proteins
 BACKBONE_ATOMS = {'N', 'CA', 'C', 'O', 'H', 'HA'}
 
+# Standard amino acid residue names (to distinguish from water, ligands, etc.)
+AMINO_ACIDS = {
+    'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE',
+    'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL',
+    # Common variants
+    'HIE', 'HID', 'HIP', 'CYX', 'ASH', 'GLH'
+}
+
 
 @dataclass
 class ChainInfo:
@@ -125,6 +133,12 @@ class ScaleMDConfig:
     minimize_first: bool = True
     minimize_steps: int = 500  # Max steps for energy minimization
 
+    # Heating/Annealing phase
+    heating_enabled: bool = False
+    heating_target_temp: float = 500.0  # Target temperature for heating (K)
+    heating_steps: int = 5000           # Number of heating steps
+    heating_fix_all_backbone: bool = True  # Fix backbone of ALL chains during heating
+
 
 def extract_chain_info(pdb_structure: PDBStructure) -> ChainInfo:
     """
@@ -171,6 +185,8 @@ def create_backbone_mask(pdb_structure: PDBStructure, chains: List[str]) -> np.n
     """
     Create mask for backbone atoms of specified chains.
 
+    Only applies to standard amino acid residues (not water, ligands, etc.)
+
     Args:
         pdb_structure: PDBStructure from read_pdb
         chains: List of chain IDs to fix backbone for
@@ -182,7 +198,11 @@ def create_backbone_mask(pdb_structure: PDBStructure, chains: List[str]) -> np.n
     mask = np.zeros(n_atoms, dtype=bool)
 
     for i, atom in enumerate(pdb_structure.atoms):
-        if atom.chain in chains and atom.name in BACKBONE_ATOMS:
+        # Only consider backbone atoms in amino acid residues
+        resname = atom.resname.strip().upper()
+        if (atom.chain in chains and
+            atom.name in BACKBONE_ATOMS and
+            resname in AMINO_ACIDS):
             mask[i] = True
 
     n_fixed = np.sum(mask)
@@ -356,7 +376,7 @@ class ScaleMDSimulation:
         )
         print(f"# Initial COM of chain {config.chain_of_interest}: {self.initial_com}")
 
-        # Backbone fixing mask
+        # Backbone fixing mask for production runs
         if config.fix_backbone_enabled:
             self.backbone_mask = create_backbone_mask(
                 self.pdb_structure,
@@ -367,8 +387,19 @@ class ScaleMDSimulation:
             self.backbone_mask = np.zeros(self.pdb_structure.natoms, dtype=bool)
             self.mobile_mask = np.ones(self.pdb_structure.natoms, dtype=bool)
 
+        # Backbone mask for ALL chains (used during heating)
+        self.all_backbone_mask = create_backbone_mask(
+            self.pdb_structure,
+            self.chain_info.unique_chains
+        )
+        self.all_mobile_mask = ~self.all_backbone_mask
+
         # Reference coordinates for fixed atoms
         self.reference_coords = self.pdb_structure.coordinates.copy()
+
+        # Heated state (coordinates and velocities) - populated after heating
+        self.heated_coords = None
+        self.heated_velocities = None
 
         # Initialize model and system
         self._initialize_system()
@@ -526,6 +557,112 @@ class ScaleMDSimulation:
 
         return coords
 
+    def _heat_system(self, coordinates: np.ndarray, target_temp: float,
+                     nsteps: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Heat the system gradually from low temperature to target temperature.
+
+        During heating, backbone atoms of ALL chains are fixed to prevent
+        structural drift. This establishes a thermalized state for production runs.
+
+        Args:
+            coordinates: Initial coordinates (usually minimized)
+            target_temp: Target temperature in Kelvin
+            nsteps: Number of heating steps
+
+        Returns:
+            Tuple of (heated_coordinates, heated_velocities)
+        """
+        print(f"\n# Heating phase: 0 K -> {target_temp} K over {nsteps} steps")
+        print(f"# Fixing backbone of ALL chains during heating")
+
+        # Use all-backbone mask during heating
+        heating_backbone_mask = self.all_backbone_mask
+        heating_mobile_mask = self.all_mobile_mask
+        n_mobile_heating = int(np.sum(heating_mobile_mask))
+
+        print(f"# Mobile atoms during heating: {n_mobile_heating}")
+
+        coords = coordinates.copy()
+        dt = self.config.timestep * au.FS
+        dt2 = 0.5 * dt
+        mass = self.system_data["mass"]
+        dt2m = dt2 / mass[:, None]
+
+        # Start with zero velocities
+        velocities = np.zeros((self.system_data["nat"], 3), dtype=self.fprec)
+
+        # Langevin thermostat base parameters
+        gamma = self.config.gamma / 1000.0  # Convert ps^-1 to fs^-1
+        gamma_au = gamma * au.FS
+
+        # Create conformation for force calculation
+        conformation = {**self.conformation, "coordinates": coords}
+
+        for step in range(1, nsteps + 1):
+            # Linear temperature ramp
+            current_temp = target_temp * (step / nsteps)
+            kT = current_temp / au.KELVIN
+
+            # Update Langevin parameters for current temperature
+            c1 = np.exp(-gamma_au * dt)
+            c2 = np.sqrt((1 - c1**2) * kT / mass[:, None])
+
+            # Preprocess and compute forces (no scaling during heating)
+            preproc_state, conformation = self.model.preprocessing(
+                self.preproc_state, conformation
+            )
+            epot_raw, forces, _ = self.model._energy_and_forces(
+                self.model.variables, conformation
+            )
+            forces = np.array(forces) / self.model_energy_unit
+            epot = float(np.mean(np.array(epot_raw))) / self.model_energy_unit
+
+            # Zero forces for fixed atoms
+            forces[heating_backbone_mask] = 0.0
+
+            # Velocity Verlet - first half
+            velocities = velocities + forces * dt2m
+            velocities[heating_backbone_mask] = 0.0
+
+            # Position update
+            coords = coords + velocities * dt
+            coords[heating_backbone_mask] = self.reference_coords[heating_backbone_mask]
+
+            # Recompute forces at new positions
+            conformation = {**conformation, "coordinates": coords}
+            preproc_state, conformation = self.model.preprocessing(
+                self.preproc_state, conformation
+            )
+            epot_raw, forces, _ = self.model._energy_and_forces(
+                self.model.variables, conformation
+            )
+            forces = np.array(forces) / self.model_energy_unit
+            epot = float(np.mean(np.array(epot_raw))) / self.model_energy_unit
+            forces[heating_backbone_mask] = 0.0
+
+            # Velocity Verlet - second half
+            velocities = velocities + forces * dt2m
+            velocities[heating_backbone_mask] = 0.0
+
+            # Langevin thermostat
+            random_forces = np.random.randn(*velocities.shape).astype(self.fprec)
+            velocities = c1 * velocities + c2 * random_forces
+            velocities[heating_backbone_mask] = 0.0
+
+            # Compute actual temperature
+            ek = 0.5 * np.sum(mass[:, None] * velocities**2 * heating_mobile_mask[:, None])
+            actual_temp = float(2 * ek / (3 * n_mobile_heating) * au.KELVIN)
+
+            # Print progress
+            if step % 500 == 0 or step == nsteps:
+                print(f"#   Step {step:6d}: E = {epot:.4f} Ha, "
+                      f"T_target = {current_temp:.1f} K, T_actual = {actual_temp:.1f} K")
+
+        print(f"# Heating complete. Final temperature: {actual_temp:.1f} K")
+
+        return coords, velocities
+
     def _compute_forces_with_scaling(self, coordinates: np.ndarray,
                                       alpha: float,
                                       report_forces: bool = False
@@ -631,7 +768,8 @@ class ScaleMDSimulation:
     def run_single_alpha(self, alpha: float,
                          initial_coords: np.ndarray,
                          trajectory_file: str,
-                         distance_writer) -> Tuple[np.ndarray, bool]:
+                         distance_writer,
+                         initial_velocities: Optional[np.ndarray] = None) -> Tuple[np.ndarray, bool]:
         """
         Run simulation for a single alpha value.
 
@@ -640,6 +778,7 @@ class ScaleMDSimulation:
             initial_coords: Starting coordinates
             trajectory_file: Path to trajectory output file
             distance_writer: File handle for distance output
+            initial_velocities: Optional starting velocities (from heated state)
 
         Returns:
             Tuple of (final_coordinates, early_stopped)
@@ -651,7 +790,11 @@ class ScaleMDSimulation:
 
         # Initialize
         coords = initial_coords.copy()
-        velocities = self._assign_velocities(self.config.temperature)
+        if initial_velocities is not None:
+            velocities = initial_velocities.copy()
+            print(f"# Using heated velocities")
+        else:
+            velocities = self._assign_velocities(self.config.temperature)
 
         dt = self.config.timestep * au.FS
         dt2 = 0.5 * dt
@@ -797,6 +940,27 @@ class ScaleMDSimulation:
         print(f"# Post-minimization COM of chain {self.config.chain_of_interest}: "
               f"{self.initial_com}")
 
+        # Heating phase (if enabled)
+        if self.config.heating_enabled:
+            self.heated_coords, self.heated_velocities = self._heat_system(
+                self.minimized_coords,
+                target_temp=self.config.heating_target_temp,
+                nsteps=self.config.heating_steps
+            )
+            # Update reference COM after heating
+            self.initial_com = compute_chain_com(
+                self.heated_coords, self.coi_mask, self.masses
+            )
+            print(f"# Post-heating COM of chain {self.config.chain_of_interest}: "
+                  f"{self.initial_com}")
+            # Use heated state for production runs
+            production_coords = self.heated_coords
+            production_velocities = self.heated_velocities
+        else:
+            # No heating - use minimized coords and random velocities
+            production_coords = self.minimized_coords
+            production_velocities = None
+
         # Open distance output file
         with open(self.config.distance_file, 'w') as dist_file:
             if self.config.report_inter_chain_forces:
@@ -810,9 +974,10 @@ class ScaleMDSimulation:
 
                 final_coords, early_stopped = self.run_single_alpha(
                     alpha=alpha,
-                    initial_coords=self.minimized_coords.copy(),
+                    initial_coords=production_coords.copy(),
                     trajectory_file=traj_file,
-                    distance_writer=dist_file
+                    distance_writer=dist_file,
+                    initial_velocities=production_velocities
                 )
 
                 status = "EARLY STOPPED" if early_stopped else "COMPLETED"
@@ -917,6 +1082,17 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         minimize_first = minimize_first.lower() in ("true", "yes", "1")
     min_steps_minimize = int(scale_md_params.get("min_steps", 500))
 
+    # Heating/Annealing phase
+    heating = scale_md_params.get("heating", {})
+    heating_enabled = heating.get("enabled", False)
+    if isinstance(heating_enabled, str):
+        heating_enabled = heating_enabled.lower() in ("true", "yes", "1")
+    heating_target_temp = float(heating.get("target_temp", 500.0))
+    heating_steps = int(heating.get("steps", 5000))
+    heating_fix_all_backbone = heating.get("fix_all_backbone", True)
+    if isinstance(heating_fix_all_backbone, str):
+        heating_fix_all_backbone = heating_fix_all_backbone.lower() in ("true", "yes", "1")
+
     return ScaleMDConfig(
         pdb_file=str(pdb_file).strip('"\''),
         chain_of_interest=str(chain_of_interest).strip('"\''),
@@ -938,6 +1114,10 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         gamma=gamma,
         minimize_first=minimize_first,
         minimize_steps=min_steps_minimize,
+        heating_enabled=heating_enabled,
+        heating_target_temp=heating_target_temp,
+        heating_steps=heating_steps,
+        heating_fix_all_backbone=heating_fix_all_backbone,
     )
 
 
