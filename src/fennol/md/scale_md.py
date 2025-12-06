@@ -29,9 +29,13 @@ Config file example:
         early_stopping {
             enabled = true
             distance_threshold = 20.0     # Angstroms
-            min_steps = 1000
+            min_steps = 1000              # Min steps before early stopping
             check_frequency = 100
         }
+
+        # Minimization options
+        minimize = true
+        min_steps = 500                   # Max minimization steps
 
         # Force reporting options
         report_inter_chain_forces = true  # Enable inter-chain force output
@@ -96,7 +100,7 @@ class ScaleMDConfig:
     # Early stopping
     early_stopping_enabled: bool = True
     distance_threshold: float = 20.0    # Angstroms
-    min_steps: int = 1000
+    early_stopping_min_steps: int = 1000  # Min steps before early stopping allowed
     check_frequency: int = 100
 
     # Output
@@ -119,7 +123,7 @@ class ScaleMDConfig:
 
     # Minimization
     minimize_first: bool = True
-    min_steps: int = 500
+    minimize_steps: int = 500  # Max steps for energy minimization
 
 
 def extract_chain_info(pdb_structure: PDBStructure) -> ChainInfo:
@@ -748,7 +752,7 @@ class ScaleMDSimulation:
 
                 # Early stopping check
                 if (self.config.early_stopping_enabled and
-                    step >= self.config.min_steps and
+                    step >= self.config.early_stopping_min_steps and
                     step % self.config.check_frequency == 0):
 
                     if distance >= self.config.distance_threshold:
@@ -781,7 +785,7 @@ class ScaleMDSimulation:
             print("\n# Minimizing initial structure...")
             self.minimized_coords = self._minimize(
                 self.pdb_structure.coordinates.copy(),
-                max_steps=self.config.min_steps
+                max_steps=self.config.minimize_steps
             )
         else:
             self.minimized_coords = self.pdb_structure.coordinates.copy()
@@ -921,7 +925,7 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         fix_backbone_chains=fix_backbone_chains,
         early_stopping_enabled=early_stopping_enabled,
         distance_threshold=distance_threshold,
-        min_steps=min_steps_early,
+        early_stopping_min_steps=min_steps_early,
         check_frequency=check_frequency,
         trajectory_prefix=trajectory_prefix,
         distance_file=distance_file,
@@ -933,6 +937,7 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         thermostat=thermostat_str,
         gamma=gamma,
         minimize_first=minimize_first,
+        minimize_steps=min_steps_minimize,
     )
 
 
