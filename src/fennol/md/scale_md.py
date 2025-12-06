@@ -122,6 +122,11 @@ class ScaleMDConfig:
     # Reporting frequency (how often to write distances/forces to file)
     report_frequency: int = 1  # Write every N steps (1 = every step)
 
+    # Rigorous inter-chain force scaling (requires 2x force evaluations per step)
+    # If True: Uses pairwise decomposition to identify true inter-chain forces
+    # If False: Uses geometric approximation (radial/tangential decomposition)
+    rigorous_scaling: bool = True
+
     # MD parameters
     temperature: float = 300.0
     timestep: float = 1.0               # fs
@@ -269,6 +274,39 @@ def create_inter_chain_pair_mask(chain_info: ChainInfo,
     other_mask = ~coi_mask
 
     return coi_mask, other_mask
+
+
+def create_inter_chain_edge_mask(
+    edge_src: np.ndarray,
+    edge_dst: np.ndarray,
+    coi_mask: np.ndarray
+) -> np.ndarray:
+    """
+    Create a mask identifying inter-chain edges in the neighbor list.
+
+    An edge is inter-chain if one atom is in the chain of interest (COI)
+    and the other atom is not.
+
+    Args:
+        edge_src: Source atom indices for each edge [n_edges]
+        edge_dst: Destination atom indices for each edge [n_edges]
+        coi_mask: Boolean mask where True = atom is in chain of interest [n_atoms]
+
+    Returns:
+        Boolean mask where True = edge is inter-chain [n_edges]
+    """
+    # Get chain membership for source and destination atoms
+    # Handle padding (indices >= n_atoms should be False)
+    n_atoms = len(coi_mask)
+
+    # Safe indexing - treat out-of-bounds as not in COI
+    src_in_coi = np.where(edge_src < n_atoms, coi_mask[np.minimum(edge_src, n_atoms - 1)], False)
+    dst_in_coi = np.where(edge_dst < n_atoms, coi_mask[np.minimum(edge_dst, n_atoms - 1)], False)
+
+    # Inter-chain edge: one in COI, one not (XOR operation)
+    inter_chain_mask = src_in_coi != dst_in_coi
+
+    return inter_chain_mask
 
 
 def compute_inter_chain_force_magnitude(
@@ -670,29 +708,161 @@ class ScaleMDSimulation:
         """
         Compute forces with inter-chain scaling.
 
-        For pairs where one atom is in chain_of_interest and the other is not,
-        the force is scaled by alpha.
-
-        This is implemented by:
-        1. Computing full forces
-        2. Identifying inter-chain contributions (approximation: scale forces on
-           chain of interest atoms that point toward/away from other chains)
-
-        A more rigorous implementation would require modifying the force
-        calculation at the neighbor list level, but this approximation works
-        well for the unbinding kinetics use case.
+        Dispatches to either rigorous or approximate method based on config.
 
         Args:
             coordinates: Atomic coordinates [n_atoms, 3]
             alpha: Scaling factor for inter-chain forces
-            report_forces: If True, return inter-chain force info (no extra cost)
+            report_forces: If True, return inter-chain force info
 
         Returns:
             Tuple of (potential energy, forces [n_atoms, 3], force_info)
-            where force_info is None if not requested, or dict with:
-            - F_radial_unscaled: Unscaled radial force magnitude
-            - F_radial_scaled: Scaled radial force magnitude (alpha * unscaled)
-            - F_tangential: Tangential force magnitude (unchanged by scaling)
+        """
+        if self.config.rigorous_scaling:
+            return self._compute_forces_rigorous(coordinates, alpha, report_forces)
+        else:
+            return self._compute_forces_approximate(coordinates, alpha, report_forces)
+
+    def _compute_forces_rigorous(self, coordinates: np.ndarray,
+                                  alpha: float,
+                                  report_forces: bool = False
+                                  ) -> Tuple[float, np.ndarray, Optional[Dict[str, float]]]:
+        """
+        Compute forces with rigorous pairwise inter-chain scaling.
+
+        This method correctly identifies inter-chain forces by:
+        1. Computing full forces with all interactions
+        2. Computing forces with inter-chain edges masked out (intra-chain only)
+        3. Inter-chain forces = full forces - intra-chain forces
+        4. Scaled forces = intra-chain + alpha * inter-chain
+
+        This requires 2x force evaluations but correctly separates inter-chain
+        from intra-chain contributions.
+
+        Args:
+            coordinates: Atomic coordinates [n_atoms, 3]
+            alpha: Scaling factor for inter-chain forces
+            report_forces: If True, return inter-chain force info
+
+        Returns:
+            Tuple of (potential energy, forces [n_atoms, 3], force_info)
+        """
+        # Create conformation
+        conformation = {**self.conformation, "coordinates": coordinates}
+
+        # Preprocess to get neighbor list
+        preproc_state, conformation = self.model.preprocessing(
+            self.preproc_state, conformation
+        )
+
+        # === Step 1: Compute full forces (all interactions) ===
+        epot_full, forces_full, _ = self.model._energy_and_forces(
+            self.model.variables, conformation
+        )
+        forces_full = np.array(forces_full) / self.model_energy_unit
+        epot = float(np.mean(epot_full)) / self.model_energy_unit
+
+        # === Step 2: Create masked conformation for intra-chain only ===
+        # Get edge arrays from the graph
+        graph = conformation.get("graph", {})
+        edge_src = np.array(graph.get("edge_src", []))
+        edge_dst = np.array(graph.get("edge_dst", []))
+
+        if len(edge_src) == 0:
+            # No neighbor list - fall back to approximate method
+            return self._compute_forces_approximate(coordinates, alpha, report_forces)
+
+        # Create inter-chain edge mask
+        inter_chain_edge_mask = create_inter_chain_edge_mask(
+            edge_src, edge_dst, self.coi_mask
+        )
+
+        # Create intra-chain only mask (edges that are NOT inter-chain)
+        intra_chain_edge_mask = ~inter_chain_edge_mask
+
+        # Get original switch function (smoothly turns off at cutoff)
+        original_switch = graph.get("switch")
+        if original_switch is None:
+            # No switch function - fall back to approximate method
+            return self._compute_forces_approximate(coordinates, alpha, report_forces)
+
+        original_switch = np.array(original_switch)
+
+        # Zero out the switch for inter-chain edges
+        # This effectively removes inter-chain interactions
+        masked_switch = np.where(intra_chain_edge_mask, original_switch, 0.0)
+
+        # Also need to update edge_mask if present
+        original_edge_mask = graph.get("edge_mask", np.ones(len(edge_src), dtype=bool))
+        if hasattr(original_edge_mask, '__array__'):
+            original_edge_mask = np.array(original_edge_mask)
+        masked_edge_mask = intra_chain_edge_mask & original_edge_mask
+
+        # Create modified graph with inter-chain edges zeroed out
+        masked_graph = {
+            **graph,
+            "switch": jnp.array(masked_switch),
+            "edge_mask": jnp.array(masked_edge_mask)
+        }
+
+        # Create masked conformation
+        masked_conformation = {**conformation, "graph": masked_graph}
+
+        # === Step 3: Compute intra-chain forces ===
+        epot_intra, forces_intra, _ = self.model._energy_and_forces(
+            self.model.variables, masked_conformation
+        )
+        forces_intra = np.array(forces_intra) / self.model_energy_unit
+
+        # === Step 4: Compute inter-chain forces and apply scaling ===
+        # Inter-chain forces = full forces - intra-chain forces
+        forces_inter = forces_full - forces_intra
+
+        # Scaled forces = intra-chain + alpha * inter-chain
+        forces_scaled = forces_intra + alpha * forces_inter
+
+        # Zero forces for fixed atoms
+        forces_scaled[self.backbone_mask] = 0.0
+
+        # Compute force info for reporting
+        force_info = None
+        if report_forces:
+            # Compute magnitudes of inter-chain forces on chain of interest
+            coi_inter_forces = forces_inter[self.coi_mask]
+            coi_intra_forces = forces_intra[self.coi_mask]
+
+            total_inter_force = np.sum(coi_inter_forces, axis=0)
+            total_intra_force = np.sum(coi_intra_forces, axis=0)
+
+            inter_mag = float(np.linalg.norm(total_inter_force))
+            intra_mag = float(np.linalg.norm(total_intra_force))
+
+            force_info = {
+                "F_inter_unscaled": inter_mag,
+                "F_inter_scaled": float(alpha * inter_mag),
+                "F_intra": intra_mag,
+            }
+
+        return epot, forces_scaled, force_info
+
+    def _compute_forces_approximate(self, coordinates: np.ndarray,
+                                     alpha: float,
+                                     report_forces: bool = False
+                                     ) -> Tuple[float, np.ndarray, Optional[Dict[str, float]]]:
+        """
+        Compute forces with approximate geometric inter-chain scaling.
+
+        This uses the radial/tangential decomposition relative to chain COMs.
+        It's faster (1x force evaluation) but may incorrectly scale some
+        intra-chain forces that happen to point toward the other chain.
+
+        Args:
+            coordinates: Atomic coordinates [n_atoms, 3]
+            alpha: Scaling factor for inter-chain forces
+            report_forces: If True, return inter-chain force info
+
+        Returns:
+            Tuple of (potential energy, forces [n_atoms, 3], force_info)
         """
         # Create conformation
         conformation = {**self.conformation, "coordinates": coordinates}
@@ -743,9 +913,9 @@ class ScaleMDSimulation:
 
         if report_forces:
             force_info = {
-                "F_radial_unscaled": radial_mag_unscaled,
-                "F_radial_scaled": radial_mag_scaled,
-                "F_tangential": tangential_mag,
+                "F_inter_unscaled": radial_mag_unscaled,
+                "F_inter_scaled": radial_mag_scaled,
+                "F_intra": tangential_mag,
             }
 
         # Scale only the radial (inter-chain) component
@@ -865,9 +1035,9 @@ class ScaleMDSimulation:
                     if report_forces and inter_chain_info is not None:
                         distance_writer.write(
                             f"{alpha:.4f} {sim_time:.6f} {distance:.6f} "
-                            f"{inter_chain_info['F_radial_unscaled']:.6f} "
-                            f"{inter_chain_info['F_radial_scaled']:.6f} "
-                            f"{inter_chain_info['F_tangential']:.6f}\n"
+                            f"{inter_chain_info['F_inter_unscaled']:.6f} "
+                            f"{inter_chain_info['F_inter_scaled']:.6f} "
+                            f"{inter_chain_info['F_intra']:.6f}\n"
                         )
                     else:
                         distance_writer.write(f"{alpha:.4f} {sim_time:.6f} {distance:.6f}\n")
@@ -878,8 +1048,8 @@ class ScaleMDSimulation:
                     if report_forces and inter_chain_info is not None:
                         print(f"  Step {step:6d}: E = {epot:.4f} Ha, T = {temp:.1f} K, "
                               f"d = {distance:.2f} A, "
-                              f"F_radial = {inter_chain_info['F_radial_unscaled']:.4f} "
-                              f"(scaled: {inter_chain_info['F_radial_scaled']:.4f})")
+                              f"F_inter = {inter_chain_info['F_inter_unscaled']:.4f} "
+                              f"(scaled: {inter_chain_info['F_inter_scaled']:.4f})")
                     else:
                         print(f"  Step {step:6d}: E = {epot:.4f} Ha, T = {temp:.1f} K, "
                               f"d = {distance:.2f} A")
@@ -920,6 +1090,8 @@ class ScaleMDSimulation:
         print(f"# Temperature: {self.config.temperature} K")
         print(f"# Timestep: {self.config.timestep} fs")
         print(f"# Report frequency: every {self.config.report_frequency} steps")
+        scaling_method = "RIGOROUS (pairwise)" if self.config.rigorous_scaling else "APPROXIMATE (geometric)"
+        print(f"# Force scaling method: {scaling_method}")
         if self.config.report_inter_chain_forces:
             print(f"# Inter-chain force reporting: ENABLED")
 
@@ -964,7 +1136,7 @@ class ScaleMDSimulation:
         # Open distance output file
         with open(self.config.distance_file, 'w') as dist_file:
             if self.config.report_inter_chain_forces:
-                dist_file.write("# alpha time_ps distance_A F_radial_unscaled F_radial_scaled F_tangential\n")
+                dist_file.write("# alpha time_ps distance_A F_inter_unscaled F_inter_scaled F_intra\n")
             else:
                 dist_file.write("# alpha time_ps distance_A\n")
 
@@ -1069,6 +1241,11 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
     # Reporting frequency (how often to write to distance file)
     report_frequency = int(scale_md_params.get("report_frequency", 1))
 
+    # Rigorous scaling (pairwise decomposition - requires 2x force evaluations)
+    rigorous_scaling = scale_md_params.get("rigorous_scaling", True)
+    if isinstance(rigorous_scaling, str):
+        rigorous_scaling = rigorous_scaling.lower() in ("true", "yes", "1")
+
     # MD parameters
     temperature = float(simulation_parameters.get("temperature", 300.0))
     timestep = float(simulation_parameters.get("dt", 1.0))
@@ -1107,6 +1284,7 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         distance_file=distance_file,
         report_inter_chain_forces=report_inter_chain_forces,
         report_frequency=report_frequency,
+        rigorous_scaling=rigorous_scaling,
         temperature=temperature,
         timestep=timestep,
         nsteps_per_alpha=nsteps_per_alpha,
