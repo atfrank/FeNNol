@@ -20,6 +20,8 @@ from ..utils.atomic_units import AtomicUnits as au
 from ..utils.input_parser import parse_input
 from .initial import initialize_system
 from .energy_formatter import format_energy_for_display, update_final_energy_display
+from .restraints import setup_restraints, apply_restraints
+from .fixed_atoms import setup_fixed_atoms
 
 class Minimizer:
     """Base class for energy minimization algorithms"""
@@ -58,10 +60,48 @@ class Minimizer:
         self.max_step = simulation_parameters.get("min_max_step", 0.2)  # Maximum step size in Angstroms
         self.print_freq = int(simulation_parameters.get("min_print_freq", 10))
         self.history_size = int(simulation_parameters.get("min_history_size", 10))
-        
+
         # Determine output options
         self.output_prefix = system_data["name"]
-        
+
+        # Setup restraints if configured
+        self.use_restraints = simulation_parameters.get("min_use_restraints", False)
+        if isinstance(self.use_restraints, str):
+            self.use_restraints = self.use_restraints.lower() in ("yes", "true", "1", "on")
+
+        self.restraint_forces = []
+        if self.use_restraints:
+            restraints_definitions = simulation_parameters.get("restraints", None)
+            if restraints_definitions is not None:
+                initial_coords = conformation.get("coordinates", None)
+                atom_symbols = system_data.get("symbols", None)
+                _, self.restraint_forces, _ = setup_restraints(
+                    restraints_definitions,
+                    nsteps=None,  # No time-varying during minimization
+                    initial_coordinates=initial_coords,
+                    pdb_data=None,
+                    symbols=atom_symbols
+                )
+                print(f"# Minimization with {len(self.restraint_forces)} restraint(s) enabled")
+
+        # Setup fixed atoms if configured
+        fixed_atoms_config = simulation_parameters.get("fixed_atoms", None)
+        self.use_fixed_atoms = fixed_atoms_config is not None
+        if self.use_fixed_atoms:
+            self.system_data = setup_fixed_atoms(fixed_atoms_config, self.system_data, conformation)
+            # Create JAX arrays for mask and reference coordinates
+            self.mobile_mask = jnp.asarray(~self.system_data["fixed_mask"], dtype=fprec)[:, None]
+            self.n_mobile = self.system_data["n_mobile_atoms"]
+            self.reference_coords = jnp.asarray(self.system_data["reference_coordinates"], dtype=fprec)
+            print(f"# Fixed atoms: {self.nat - self.n_mobile} atoms frozen, {self.n_mobile} mobile")
+        else:
+            self.mobile_mask = None
+            self.n_mobile = self.nat
+            self.reference_coords = None
+
+        # Track if trajectory file has been initialized (for overwriting on first write)
+        self._traj_initialized = False
+
     def _prepare_system(self, coordinates):
         """Helper method to create a system dictionary with the given coordinates"""
         try:
@@ -163,7 +203,20 @@ class Minimizer:
         # Scale to atomic units
         epot = epot / self.model_energy_unit
         forces = forces / self.model_energy_unit
-        
+
+        # Apply restraints if enabled
+        if self.use_restraints and len(self.restraint_forces) > 0:
+            restraint_energy, restraint_forces_array = apply_restraints(
+                coordinates, self.restraint_forces, step=0
+            )
+            # Restraint energies are already in atomic units (Hartree)
+            epot = epot + restraint_energy
+            forces = forces + restraint_forces_array
+
+        # Zero forces on fixed atoms
+        if self.use_fixed_atoms and self.mobile_mask is not None:
+            forces = forces * self.mobile_mask
+
         # Convert energy to scalar if it's an array
         if isinstance(epot, jnp.ndarray) and epot.size > 0:
             epot_scalar = epot[0]
@@ -211,6 +264,16 @@ class Minimizer:
     def run(self):
         """Run the minimization - must be implemented by subclasses"""
         raise NotImplementedError("Subclasses must implement the run method")
+
+    def _apply_fixed_atoms(self, coords_flat):
+        """Restore fixed atom positions to reference coordinates"""
+        if not self.use_fixed_atoms or self.mobile_mask is None:
+            return coords_flat
+        # Reshape to (N, 3) for masking
+        coords = coords_flat.reshape(-1, 3)
+        # mobile_mask has shape (N, 1), reference_coords has shape (N, 3)
+        coords = coords * self.mobile_mask + self.reference_coords * (1.0 - self.mobile_mask)
+        return coords.reshape(-1)
     
     def _format_energy(self, energy_value):
         """Format energy for display in MD-compatible units"""
@@ -248,25 +311,29 @@ class Minimizer:
         """Print the minimization header"""
         print("#" + "=" * 78)
         print(f"# Starting geometry optimization using {self.__class__.__name__}")
-        
+
         # Get model energy unit and determine if displaying per-atom energy
         energy_unit_str = self.params.get("energy_unit", "kcal/mol")
         per_atom_energy = self.params.get("per_atom_energy", True)
         nat = self.system_data["nat"]
         atom_energy_unit_str = energy_unit_str
-        
+
         if per_atom_energy:
             atom_energy_unit_str = f"{energy_unit_str}/atom"
             print(f"# Energy displayed per atom in {energy_unit_str}/atom")
         else:
             print(f"# Energy displayed in {energy_unit_str}")
-            
+
         print(f"# Number of atoms: {nat}")
         print(f"# Maximum iterations: {self.max_iterations}")
         print(f"# Energy tolerance: {self.energy_tolerance}")
         print(f"# Force tolerance: {self.force_tolerance}")
         print(f"# Displacement tolerance: {self.displacement_tolerance}")
         print(f"# Maximum step size: {self.max_step} Å")
+        if self.use_restraints and len(self.restraint_forces) > 0:
+            print(f"# Restraints: {len(self.restraint_forces)} active")
+        if self.use_fixed_atoms:
+            print(f"# Fixed atoms: {self.nat - self.n_mobile} frozen, {self.n_mobile} mobile")
         print("#" + "=" * 78)
         print(f"# Iter      Energy[{atom_energy_unit_str}]   Max Force     RMS Force      Max Disp      Time/step")
         print("#" + "-" * 78)
@@ -324,9 +391,15 @@ class Minimizer:
         properties["energy"] = float(energy) * self.model_energy_unit
         properties["step"] = iteration
         properties["energy_unit"] = self.model.energy_unit
-        
-        # Open file in append mode
-        with open(f"{self.output_prefix}{traj_ext}", "a") as f:
+
+        # Use write mode on first call to overwrite existing file, then append
+        if not self._traj_initialized:
+            file_mode = "w"
+            self._traj_initialized = True
+        else:
+            file_mode = "a"
+
+        with open(f"{self.output_prefix}{traj_ext}", file_mode) as f:
             coords_reshaped = coords.reshape(-1, 3)
             write_frame(
                 f,
@@ -399,7 +472,10 @@ class SteepestDescentMinimizer(Minimizer):
             
             # Take step in the direction of the force
             new_coords = coords + step
-            
+
+            # Restore fixed atom positions
+            new_coords = self._apply_fixed_atoms(new_coords)
+
             # Evaluate energy at new position
             new_energy, new_forces, new_system, new_preproc_state, new_model_out = self._evaluate_energy_forces(
                 new_coords, system, preproc_state
@@ -691,7 +767,8 @@ class ConjugateGradientMinimizer(Minimizer):
         
         # Initial trial step
         trial_coords = coords + alpha * direction
-        
+        trial_coords = self._apply_fixed_atoms(trial_coords)
+
         # Perform line search
         if self.line_search_method == "backtracking":
             # Simple backtracking line search
@@ -715,15 +792,17 @@ class ConjugateGradientMinimizer(Minimizer):
                     # Try a bigger step
                     alpha *= 1.5
                     trial_coords = coords + alpha * direction
+                    trial_coords = self._apply_fixed_atoms(trial_coords)
                 else:
                     # Step was too big, back up
                     alpha *= 0.5
-                    
+
                     # If alpha became very small, stop the line search
                     if alpha < 1e-6:
                         break
-                        
+
                     trial_coords = coords + alpha * direction
+                    trial_coords = self._apply_fixed_atoms(trial_coords)
                     
         else:  # More sophisticated Strong Wolfe line search
             # Constants for Strong Wolfe conditions
@@ -769,7 +848,8 @@ class ConjugateGradientMinimizer(Minimizer):
                     
                 # Update trial point
                 trial_coords = coords + alpha * direction
-                
+                trial_coords = self._apply_fixed_atoms(trial_coords)
+
                 # If alpha became very small or too large, stop the line search
                 if alpha < 1e-6 or alpha > 100.0:
                     break
@@ -989,8 +1069,11 @@ class SimpleSteepestDescentMinimizer(Minimizer):
             
             # Take step in the direction of the force
             new_coords = coords_flat + step
+
+            # Restore fixed atom positions
+            new_coords = self._apply_fixed_atoms(new_coords)
             new_atom_coords = new_coords.reshape(-1, 3)
-            
+
             # Evaluate energy at new position
             try:
                 new_energy, new_forces = self._direct_eval_ef(new_atom_coords)
@@ -1070,7 +1153,7 @@ class SimpleSteepestDescentMinimizer(Minimizer):
         try:
             # Try with preprocessing first
             updated_conformation = {**self.conformation, "coordinates": coords}
-            
+
             # Use preprocessing if available
             if hasattr(self.model, 'preprocessing') and hasattr(self.model.preprocessing, 'process'):
                 try:
@@ -1083,16 +1166,28 @@ class SimpleSteepestDescentMinimizer(Minimizer):
                 except Exception:
                     # Just continue with unprocessed conformation
                     pass
-            
+
             # Calculate energy and forces
             epot, forces, _ = self.model._energy_and_forces(
                 self.model.variables, updated_conformation
             )
-            
+
             # Scale to atomic units
             epot = epot / self.model_energy_unit
             forces = forces / self.model_energy_unit
-            
+
+            # Apply restraints if enabled
+            if self.use_restraints and len(self.restraint_forces) > 0:
+                restraint_energy, restraint_forces_array = apply_restraints(
+                    coords, self.restraint_forces, step=0
+                )
+                epot = epot + restraint_energy
+                forces = forces + restraint_forces_array
+
+            # Zero forces on fixed atoms
+            if self.use_fixed_atoms and self.mobile_mask is not None:
+                forces = forces * self.mobile_mask
+
             # Return scalar energy value
             if isinstance(epot, jnp.ndarray) and epot.size > 0:
                 return epot[0], forces
