@@ -127,6 +127,12 @@ class ScaleMDConfig:
     # If False: Uses geometric approximation (radial/tangential decomposition)
     rigorous_scaling: bool = True
 
+    # Asymmetric scaling: scale attractive and repulsive forces differently
+    # If True: attractive forces scaled by 1/alpha, repulsive by alpha
+    # If False: all inter-chain forces scaled uniformly by alpha
+    # This requires rigorous_scaling=True and uses 1 force evaluation
+    asymmetric_scaling: bool = False
+
     # MD parameters
     temperature: float = 300.0
     timestep: float = 1.0               # fs
@@ -307,6 +313,78 @@ def create_inter_chain_edge_mask(
     inter_chain_mask = src_in_coi != dst_in_coi
 
     return inter_chain_mask
+
+
+def compute_per_edge_scaling_factors(
+    coordinates: np.ndarray,
+    forces: np.ndarray,
+    edge_src: np.ndarray,
+    edge_dst: np.ndarray,
+    inter_chain_edge_mask: np.ndarray,
+    alpha: float
+) -> np.ndarray:
+    """
+    Compute per-edge scaling factors based on attractive/repulsive character.
+
+    For each inter-chain edge (i,j):
+    - Attractive (force pulls i toward j): scale by 1/alpha
+    - Repulsive (force pushes i away from j): scale by alpha
+    - Intra-chain edges: scale by 1.0 (no change)
+
+    The attractive/repulsive character is determined by projecting the force
+    on atom i onto the direction vector pointing from i to j.
+
+    Args:
+        coordinates: Atomic positions [n_atoms, 3]
+        forces: Forces on all atoms [n_atoms, 3] (from full force evaluation)
+        edge_src: Source atom indices for each edge [n_edges]
+        edge_dst: Destination atom indices for each edge [n_edges]
+        inter_chain_edge_mask: Boolean mask, True for inter-chain edges [n_edges]
+        alpha: Scaling parameter (alpha > 1 accelerates unbinding)
+
+    Returns:
+        Per-edge scaling factors [n_edges]
+    """
+    n_edges = len(edge_src)
+    n_atoms = len(coordinates)
+
+    # Initialize all edges with scale factor 1.0
+    scale_factors = np.ones(n_edges, dtype=np.float64)
+
+    # Only process inter-chain edges
+    inter_chain_indices = np.where(inter_chain_edge_mask)[0]
+
+    for idx in inter_chain_indices:
+        i = edge_src[idx]
+        j = edge_dst[idx]
+
+        # Skip padding edges
+        if i >= n_atoms or j >= n_atoms:
+            continue
+
+        # Direction vector from i to j
+        r_ij = coordinates[j] - coordinates[i]
+        dist = np.linalg.norm(r_ij)
+
+        if dist < 1e-6:
+            # Atoms too close, skip
+            continue
+
+        d_ij = r_ij / dist  # Unit vector from i toward j
+
+        # Project force on atom i onto the i->j direction
+        # Positive projection = force pulls i toward j = attractive
+        # Negative projection = force pushes i away from j = repulsive
+        force_projection = np.dot(forces[i], d_ij)
+
+        if force_projection > 0:
+            # Attractive: scale DOWN by 1/alpha
+            scale_factors[idx] = 1.0 / alpha
+        else:
+            # Repulsive: scale UP by alpha
+            scale_factors[idx] = alpha
+
+    return scale_factors
 
 
 def compute_inter_chain_force_magnitude(
@@ -708,7 +786,7 @@ class ScaleMDSimulation:
         """
         Compute forces with inter-chain scaling.
 
-        Dispatches to either rigorous or approximate method based on config.
+        Dispatches to either rigorous, asymmetric, or approximate method based on config.
 
         Args:
             coordinates: Atomic coordinates [n_atoms, 3]
@@ -718,10 +796,129 @@ class ScaleMDSimulation:
         Returns:
             Tuple of (potential energy, forces [n_atoms, 3], force_info)
         """
-        if self.config.rigorous_scaling:
+        if self.config.asymmetric_scaling:
+            return self._compute_forces_asymmetric(coordinates, alpha, report_forces)
+        elif self.config.rigorous_scaling:
             return self._compute_forces_rigorous(coordinates, alpha, report_forces)
         else:
             return self._compute_forces_approximate(coordinates, alpha, report_forces)
+
+    def _compute_forces_asymmetric(self, coordinates: np.ndarray,
+                                    alpha: float,
+                                    report_forces: bool = False
+                                    ) -> Tuple[float, np.ndarray, Optional[Dict[str, float]]]:
+        """
+        Compute forces with asymmetric inter-chain scaling.
+
+        This method scales attractive and repulsive inter-chain forces differently:
+        - Attractive forces (pulling chains together): scaled by 1/alpha
+        - Repulsive forces (pushing chains apart): scaled by alpha
+
+        This accelerates unbinding by weakening attraction and enhancing repulsion.
+        Uses only 1 force evaluation by pre-scaling switch values.
+
+        Args:
+            coordinates: Atomic coordinates [n_atoms, 3]
+            alpha: Scaling parameter (alpha > 1 accelerates unbinding)
+            report_forces: If True, return inter-chain force info
+
+        Returns:
+            Tuple of (potential energy, forces [n_atoms, 3], force_info)
+        """
+        # Create conformation
+        conformation = {**self.conformation, "coordinates": coordinates}
+
+        # Preprocess to get neighbor list
+        preproc_state, conformation = self.model.preprocessing(
+            self.preproc_state, conformation
+        )
+
+        # Get edge arrays from the graph
+        graph = conformation.get("graph", {})
+        edge_src = np.array(graph.get("edge_src", []))
+        edge_dst = np.array(graph.get("edge_dst", []))
+
+        if len(edge_src) == 0:
+            # No neighbor list - fall back to approximate method
+            return self._compute_forces_approximate(coordinates, alpha, report_forces)
+
+        # Get original switch function
+        original_switch = graph.get("switch")
+        if original_switch is None:
+            return self._compute_forces_approximate(coordinates, alpha, report_forces)
+
+        original_switch = np.array(original_switch)
+
+        # Create inter-chain edge mask
+        inter_chain_edge_mask = create_inter_chain_edge_mask(
+            edge_src, edge_dst, self.coi_mask
+        )
+
+        # First, compute full forces to determine attractive/repulsive character
+        epot_full, forces_full, _ = self.model._energy_and_forces(
+            self.model.variables, conformation
+        )
+        forces_full_np = np.array(forces_full) / self.model_energy_unit
+        epot = float(np.mean(epot_full)) / self.model_energy_unit
+
+        # Compute per-edge scaling factors based on attractive/repulsive
+        edge_scale_factors = compute_per_edge_scaling_factors(
+            coordinates=coordinates,
+            forces=forces_full_np,
+            edge_src=edge_src,
+            edge_dst=edge_dst,
+            inter_chain_edge_mask=inter_chain_edge_mask,
+            alpha=alpha
+        )
+
+        # Apply scaling to switch values
+        # Intra-chain edges have scale_factor=1.0, so unchanged
+        # Inter-chain attractive edges: switch * (1/alpha)
+        # Inter-chain repulsive edges: switch * alpha
+        scaled_switch = original_switch * edge_scale_factors
+
+        # Create modified graph with scaled switches
+        scaled_graph = {
+            **graph,
+            "switch": jnp.array(scaled_switch),
+        }
+
+        # Create scaled conformation
+        scaled_conformation = {**conformation, "graph": scaled_graph}
+
+        # Compute forces with scaled switches
+        epot_scaled, forces_scaled, _ = self.model._energy_and_forces(
+            self.model.variables, scaled_conformation
+        )
+        forces_scaled = np.array(forces_scaled) / self.model_energy_unit
+
+        # Zero forces for fixed atoms
+        forces_scaled[self.backbone_mask] = 0.0
+
+        # Compute force info for reporting
+        force_info = None
+        if report_forces:
+            # Count attractive vs repulsive inter-chain edges
+            inter_chain_indices = np.where(inter_chain_edge_mask)[0]
+            n_attractive = np.sum(edge_scale_factors[inter_chain_indices] < 1.0)
+            n_repulsive = np.sum(edge_scale_factors[inter_chain_indices] > 1.0)
+
+            # Compute force magnitudes on chain of interest
+            coi_forces_full = forces_full_np[self.coi_mask]
+            coi_forces_scaled = forces_scaled[self.coi_mask]
+
+            total_force_full = np.sum(coi_forces_full, axis=0)
+            total_force_scaled = np.sum(coi_forces_scaled, axis=0)
+
+            force_info = {
+                "F_inter_unscaled": float(np.linalg.norm(total_force_full)),
+                "F_inter_scaled": float(np.linalg.norm(total_force_scaled)),
+                "F_intra": 0.0,  # Not separately computed in asymmetric mode
+                "n_attractive": int(n_attractive),
+                "n_repulsive": int(n_repulsive),
+            }
+
+        return epot, forces_scaled, force_info
 
     def _compute_forces_rigorous(self, coordinates: np.ndarray,
                                   alpha: float,
@@ -1090,7 +1287,12 @@ class ScaleMDSimulation:
         print(f"# Temperature: {self.config.temperature} K")
         print(f"# Timestep: {self.config.timestep} fs")
         print(f"# Report frequency: every {self.config.report_frequency} steps")
-        scaling_method = "RIGOROUS (pairwise)" if self.config.rigorous_scaling else "APPROXIMATE (geometric)"
+        if self.config.asymmetric_scaling:
+            scaling_method = "ASYMMETRIC (attractive/repulsive)"
+        elif self.config.rigorous_scaling:
+            scaling_method = "RIGOROUS (pairwise uniform)"
+        else:
+            scaling_method = "APPROXIMATE (geometric)"
         print(f"# Force scaling method: {scaling_method}")
         if self.config.report_inter_chain_forces:
             print(f"# Inter-chain force reporting: ENABLED")
@@ -1246,6 +1448,11 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
     if isinstance(rigorous_scaling, str):
         rigorous_scaling = rigorous_scaling.lower() in ("true", "yes", "1")
 
+    # Asymmetric scaling (scale attractive/repulsive differently)
+    asymmetric_scaling = scale_md_params.get("asymmetric_scaling", False)
+    if isinstance(asymmetric_scaling, str):
+        asymmetric_scaling = asymmetric_scaling.lower() in ("true", "yes", "1")
+
     # MD parameters
     temperature = float(simulation_parameters.get("temperature", 300.0))
     timestep = float(simulation_parameters.get("dt", 1.0))
@@ -1285,6 +1492,7 @@ def parse_scale_md_config(simulation_parameters: Dict) -> ScaleMDConfig:
         report_inter_chain_forces=report_inter_chain_forces,
         report_frequency=report_frequency,
         rigorous_scaling=rigorous_scaling,
+        asymmetric_scaling=asymmetric_scaling,
         temperature=temperature,
         timestep=timestep,
         nsteps_per_alpha=nsteps_per_alpha,
